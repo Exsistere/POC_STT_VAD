@@ -1,0 +1,13 @@
+[project]
+name = "poc-stt-vad"
+version = "0.1.0"
+description = "Add your description here"
+readme = "README.md"
+requires-python = ">=3.12"
+dependencies = [
+    "dotenv>=0.9.9",
+    "livekit-agents>=1.5.12",
+    "livekit-plugins-ai-coustics>=0.2.15",
+    "livekit-plugins-silero>=1.5.12",
+    "livekit-plugins-turn-detector>=1.5.12",
+]
