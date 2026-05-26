@@ -1343,6 +1343,7 @@ dependencies = [
     { name = "livekit-plugins-ai-coustics" },
     { name = "livekit-plugins-silero" },
     { name = "livekit-plugins-turn-detector" },
+    { name = "sounddevice" },
 ]
 
 [package.metadata]
@@ -1352,6 +1353,7 @@ requires-dist = [
     { name = "livekit-plugins-ai-coustics", specifier = ">=0.2.15" },
     { name = "livekit-plugins-silero", specifier = ">=1.5.12" },
     { name = "livekit-plugins-turn-detector", specifier = ">=1.5.12" },
+    { name = "sounddevice", specifier = ">=0.5.5" },
 ]
 
 [[package]]
