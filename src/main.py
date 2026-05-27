@@ -8,7 +8,8 @@ from livekit.agents import JobContext, JobProcess, WorkerOptions
 
 import tts_pipeline_v1 as tts_pipeline
 import stt_pipeline
-
+from livekit.agents import inference
+from livekit.agents import llm as agents_llm
 load_dotenv(override=True)
 
 # ─── Logging ──────────────────────────────────────────────────────────────────
@@ -35,6 +36,8 @@ YELLOW = "\033[33m"
 GREEN  = "\033[32m"
 RESET  = "\033[0m"
 
+
+llm = inference.LLM("openai/gpt-4o")
 
 def _ts() -> str:
     return datetime.now().strftime("%H:%M:%S.%f")[:-3]
@@ -102,13 +105,26 @@ async def _stt_consumer(ctx: JobContext) -> None:
     Wire your own logic here (LLM call, routing, logging, etc.).
     Currently just logs — no automatic STT→TTS.
     """
+    chat_ctx = agents_llm.ChatContext()
+    chat_ctx.add_message(role="system", content="You are a helpful assistant that answers questions.")
+    _log(f"[{_ts()}] STT         listening for mic input...")
     async for utterance in stt_pipeline.stt_stream(ctx):
         # ── Plug your downstream logic here ──────────────────────────────
         # Examples:
         #   response = await llm.complete(utterance)
         #   await tts_pipeline.speak(response)
         _log(f"[{_ts()}] STT RESULT  utterance received → {utterance!r}")
-
+        
+        #Add the user's message to the chat context
+        chat_ctx.add_message(role="user", content=utterance)
+        
+        #Generate a response from the LLM based on the chat context
+        stream = llm.chat(chat_ctx = chat_ctx)
+        collected = await stream.collect()
+        response = collected.text
+        _log(f"[{_ts()}] LLM REPLY   → {response[:20]!r}")
+        
+        asyncio.ensure_future(tts_pipeline.speak(response))
 
 # ─── Agent entrypoint ─────────────────────────────────────────────────────────
 
