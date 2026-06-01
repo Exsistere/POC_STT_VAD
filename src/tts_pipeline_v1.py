@@ -102,6 +102,9 @@ class TTSPipeline:
         self._speak_lock  = asyncio.Lock()   # serialise concurrent speak() calls
         self._tts_index   = 0
 
+        self._llm_cancel_fn: callable | None = None
+        self._interrupted = False
+        self._speak_tasks: set[asyncio.Task] = set()   # all in-flight speak tasks
         # sounddevice playback state
         self._sd_queue: queue.Queue | None    = None
         self._sd_stream: sd.OutputStream | None = None
@@ -159,19 +162,44 @@ class TTSPipeline:
         Usage (from main.py):
             await tts_pipeline.speak("Hello!")
         """
-        async with self._speak_lock:
-            self._speak_task = asyncio.current_task()
-            await self._synthesise_and_play(text)
+        if self._interrupted:        # ← bail before even touching _speak_tasks
+            return
+        task = asyncio.current_task()
+        self._speak_tasks.add(task)        # ← register before lock
+        try:
+            if self._interrupted:
+                return                     # ← bail if interrupted before we even start
+            async with self._speak_lock:
+                if self._interrupted:
+                    return                 # ← bail after acquiring lock too
+                self._speak_task = task
+                await self._synthesise_and_play(text)
+        finally:
+            self._speak_tasks.discard(task)  # ← always unregister
+
+    def set_llm_cancel_fn(self, cancel_fn: callable) -> None:
+        self._llm_cancel_fn = cancel_fn
 
     def interrupt(self) -> None:
         """
         Cancel TTS immediately (barge-in from VAD).
         Called by stt_pipeline when user starts speaking.
         """
-        if self._speak_task and not self._speak_task.done():
-            self._speak_task.cancel()
-            _log(f"[{_ts()}] INTERRUPTED  (barge-in detected)")
-
+        #1. cancel llm generation if in progress
+        if self._llm_cancel_fn:
+            self._llm_cancel_fn()
+        #2. cancel all tts tasks
+        self._interrupted = True
+        for t in list(self._speak_tasks):
+            if not t.done(): ##checking if task is still running before cancelling required?
+                t.cancel()
+        self._speak_tasks.clear()
+        _log(f"[{_ts()}] INTERRUPTED  (barge-in detected)")
+    
+    def reset_interrupt(self) -> None:
+        """Clear the interrupt flag so the next response can play."""
+    
+        self._interrupted = False
     @property
     def is_speaking(self) -> bool:
         return self._is_speaking

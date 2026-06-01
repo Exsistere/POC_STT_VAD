@@ -80,7 +80,8 @@ class SilentAgent(Agent):
 def prewarm(proc: JobProcess) -> None:
     try:
         proc.userdata["vad"] = silero.VAD.load(
-            activation_threshold=0.65,
+            activation_threshold=0.4,
+            min_silence_duration=0.2,
         )
     except Exception as e:
         logger.error(f"Error loading VAD: {e}")
@@ -153,7 +154,7 @@ async def stt_stream(ctx: JobContext) -> AsyncGenerator[str, None]:
 
 async def _run_session(ctx: JobContext) -> None:
     session = AgentSession(
-        stt=inference.STT(model="deepgram/nova-3", language="multi"),
+        stt=inference.STT(model="deepgram/nova-3", language="en-US"),
         vad=ctx.proc.userdata["vad"],
         turn_handling=TurnHandlingOptions(
             turn_detection="vad",
@@ -202,12 +203,14 @@ async def _run_session(ctx: JobContext) -> None:
 
     @session.on("user_state_changed")
     def on_user_state(event: UserStateChangedEvent):
+        
         nonlocal _speech_active, _speech_index, _last_interim, _utterance_parts
         nonlocal _speech_start_time, _flushed, _vad_ended, _flush_task
         nonlocal _first_final_time
 
         if event.new_state == "speaking":
             # ── Barge-in: interrupt TTS if it is currently speaking ───────
+            log_transcript(f"│  [{ts()}] USER STATE  {event.new_state}")
             if _interrupt_fn is not None:
                 try:
                     _interrupt_fn()
