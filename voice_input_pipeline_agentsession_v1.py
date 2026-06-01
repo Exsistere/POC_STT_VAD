@@ -179,7 +179,7 @@ async def my_agent(ctx: JobContext):
             _last_interim = event.transcript
             log_transcript(f"│  [{ts()}] INTERIM    [{lang}]  {event.transcript}")
             return
-
+        
         # Accumulate finals
         if not _utterance_parts:
             _first_final_time = time.monotonic()

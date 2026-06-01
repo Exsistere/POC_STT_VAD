@@ -23,7 +23,7 @@ from livekit.plugins import silero, ai_coustics
 load_dotenv(override=True)
 
 # ─── Logging ──────────────────────────────────────────────────────────────────
-# Kept identical to the original pipeline.
+
 
 logger = logging.getLogger("speech_renderer")
 logger.setLevel(logging.INFO)
@@ -75,7 +75,7 @@ class SilentAgent(Agent):
 
 
 # ─── Prewarm ──────────────────────────────────────────────────────────────────
-# Called by main.py's prewarm — kept identical to the original.
+# Called by main.py's prewarm 
 
 def prewarm(proc: JobProcess) -> None:
     try:

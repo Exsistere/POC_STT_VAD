@@ -865,6 +865,18 @@ wheels = [
 ]
 
 [[package]]
+name = "livekit-plugins-cartesia"
+version = "1.5.12"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "livekit-agents" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/6d/3c/b0903ba09ab654fabea512c900960410b2c51c6bca83b5ca375af3ef0835/livekit_plugins_cartesia-1.5.12.tar.gz", hash = "sha256:826a338436ce287a56f7666019789486999d8c11f6395eb0fe37b6943fecd632", size = 12824, upload-time = "2026-05-21T02:28:23.918Z" }
+wheels = [
+    { url = "https://files.pythonhosted.org/packages/5e/da/d729c05d1aa3932e49e5a60021d3e47b8146adccdfb9646e9dd6ed6cc7b4/livekit_plugins_cartesia-1.5.12-py3-none-any.whl", hash = "sha256:0808d394a2e56aed4817b6cb853efa90ec69e9405a6cc9c52bae52b5d843e886", size = 15753, upload-time = "2026-05-21T02:28:22.666Z" },
+]
+
+[[package]]
 name = "livekit-plugins-silero"
 version = "1.5.12"
 source = { registry = "https://pypi.org/simple" }
@@ -1341,6 +1353,7 @@ dependencies = [
     { name = "dotenv" },
     { name = "livekit-agents" },
     { name = "livekit-plugins-ai-coustics" },
+    { name = "livekit-plugins-cartesia" },
     { name = "livekit-plugins-silero" },
     { name = "livekit-plugins-turn-detector" },
     { name = "sounddevice" },
@@ -1351,6 +1364,7 @@ requires-dist = [
     { name = "dotenv", specifier = ">=0.9.9" },
     { name = "livekit-agents", specifier = ">=1.5.12" },
     { name = "livekit-plugins-ai-coustics", specifier = ">=0.2.15" },
+    { name = "livekit-plugins-cartesia", specifier = ">=1.5.12" },
     { name = "livekit-plugins-silero", specifier = ">=1.5.12" },
     { name = "livekit-plugins-turn-detector", specifier = ">=1.5.12" },
     { name = "sounddevice", specifier = ">=0.5.5" },

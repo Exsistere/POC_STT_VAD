@@ -10,7 +10,7 @@ from dotenv import load_dotenv
 
 load_dotenv(override=True)
 
-SAMPLE_RATE = 24000
+SAMPLE_RATE = 24000 
 NUM_CHANNELS = 1
 BLOCK_MS = 20  # 20ms frames → 480 samples per frame
 

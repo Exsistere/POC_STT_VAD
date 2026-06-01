@@ -120,11 +120,27 @@ async def _stt_consumer(ctx: JobContext) -> None:
         
         #Generate a response from the LLM based on the chat context
         stream = llm.chat(chat_ctx = chat_ctx)
-        collected = await stream.collect()
-        response = collected.text
-        _log(f"[{_ts()}] LLM REPLY   → {response[:20]!r}")
+        # collected = await stream.collect()
+        # response = collected.text
+        sentence_buffer = ""
+        full_response = ""
+        async with stream:
+            async for chunk in stream:
+                token = (chunk.delta and chunk.delta.content) or ""
+                sentence_buffer += token
+                full_response += token
+                
+                if sentence_buffer.endswith((". ", "? ", "! ", "\n")):
+                    if sentence_buffer.strip():
+                        _log(f"[{_ts()}] LLM STREAM   → {sentence_buffer.strip()!r}")
+                        asyncio.ensure_future(tts_pipeline.speak(sentence_buffer.strip()))
+                    sentence_buffer = ""
+        if sentence_buffer.strip():
+            _log(f"[{_ts()}] LLM STREAM   → {sentence_buffer.strip()!r}")
+            asyncio.ensure_future(tts_pipeline.speak(sentence_buffer.strip()))
+        _log(f"[{_ts()}] LLM REPLY   → {full_response[:20]!r}")
         
-        asyncio.ensure_future(tts_pipeline.speak(response))
+        # asyncio.ensure_future(tts_pipeline.speak(full_response))
 
 # ─── Agent entrypoint ─────────────────────────────────────────────────────────
 

@@ -261,3 +261,15 @@ def get_pipeline() -> TTSPipeline:
     """Return the active pipeline (used by STT pipeline to call interrupt())."""
     assert _pipeline is not None, "call init_pipeline(ctx) first"
     return _pipeline
+
+
+# if __name__ == "__main__":
+#     from livekit.agents import cli
+#     from livekit.agents import WorkerOptions
+#     text = input("Enter text to synthesise: ")
+#     cli.run_app(
+#         WorkerOptions(
+#             entrypoint_fnc=
+#         )
+#     )
+    

@@ -4,12 +4,16 @@ import queue
 import sys
 import time
 from datetime import datetime
-
+import os
+from dotenv import load_dotenv
 import numpy as np
 import sounddevice as sd
 
 from livekit import rtc
 from livekit.agents import JobContext, inference
+from livekit.plugins import cartesia
+
+load_dotenv(override=True)
 
 # ─── Logging ──────────────────────────────────────────────────────────────────
 
@@ -37,7 +41,7 @@ RESET = "\033[0m"
 
 # ─── TTS config ───────────────────────────────────────────────────────────────
 
-TTS_MODEL = "cartesia/sonic-2"
+TTS_MODEL = "sonic-2"
 TTS_VOICE = "248be419-c632-4f23-adf1-5324ed7dbf1d"  # British Lady — neutral
 
 # How many PCM frames to buffer in the sounddevice playback queue before
@@ -85,7 +89,7 @@ class TTSPipeline:
     def __init__(self, ctx: JobContext) -> None:
         self._ctx           = ctx
         self._room          = ctx.room
-        self._tts           = inference.TTS(model=TTS_MODEL, voice=TTS_VOICE)
+        self._tts           = cartesia.TTS(model=TTS_MODEL, voice=TTS_VOICE, api_key=os.getenv("CARTESIA_API_KEY"))
 
         # These are set in start() after sample-rate detection
         self._sample_rate: int | None   = None
