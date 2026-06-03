@@ -23,7 +23,7 @@ from openai import AsyncAzureOpenAI
 import asyncpg
 from livekit.agents import llm
 from dotenv import load_dotenv
-
+import time
 load_dotenv(override=True) 
 logger = logging.getLogger(__name__)
 
@@ -61,8 +61,16 @@ class ToolRegistry:
             api_version="2023-05-15",
         )
         cls._embed_model = os.getenv("AZURE_EMBEDDING_DEPLOYMENT", "")
+        asyncio.ensure_future(cls._warmup_embed())
         logger.info("ToolRegistry initialised (persona_id=%s)", persona_id)
     
+    @classmethod
+    async def _warmup_embed(cls) -> None:
+        try:
+            await cls._embed_client.embeddings.create(input="warmup", model=cls._embed_model)
+            logger.info("ToolRegistry: embed connection warmed up")
+        except Exception as exc:
+            logger.warning("ToolRegistry: embed warmup failed: %s", exc)
 
 # ─── Tool schemas (OpenAI format - kept for reference/validation) ─────────────
 
@@ -245,14 +253,61 @@ async def execute_tool(name: str, args: dict) -> str:
     kwargs = {k: args.get(k, "") for k in required_keys}
     return await impl(**kwargs)
 
+# async def main():
+#     db_pool = None
+#     dsn = os.getenv("DATABASE_URL", "postgresql://user:password@localhost:5432/voice_db")
+#     db_pool = await asyncpg.create_pool(dsn)
+#     ToolRegistry.init(db_connection=db_pool, persona_id="979425e3-927b-4ffb-8be6-84145075c425")
+#     query = "What are the products and services offered by the company"
+#     start_time = time.perf_counter()
+#     result = await search_knowledge_base(query)
+#     end_time = time.perf_counter()
+#     print(f"RAG result:\n", result[:200])
+#     print(f"RAG execution time: {end_time - start_time:.2f} seconds")
+    
 async def main():
-    db_pool = None
-    dsn = os.getenv("DATABASE_URL", "postgresql://user:password@localhost:5432/voice_db")
-    db_pool = await asyncpg.create_pool(dsn)
-    ToolRegistry.init(db_connection=db_pool, persona_id="979425e3-927b-4ffb-8be6-84145075c425")
-    query = "What are the products and services offered by the company"
-    result = await search_knowledge_base(query)
-    print("RAG result:\n", result)
+    for i in range(2):
+        dsn = os.getenv("DATABASE_URL", "postgresql://user:password@localhost:5432/voice_db")
+        db_pool = await asyncpg.create_pool(dsn)
+        ToolRegistry.init(db_connection=db_pool, persona_id="979425e3-927b-4ffb-8be6-84145075c425")
+
+        query = "What are the products and services offered by the company"
+
+        # ── Step 1: Embed ─────────────────────────────────────────────────────
+        t0 = time.perf_counter()
+        embed_response = await ToolRegistry._embed_client.embeddings.create(
+            input=query,
+            model=ToolRegistry._embed_model,
+        )
+        t1 = time.perf_counter()
+
+        # ── Step 2: pgvector search ───────────────────────────────────────────
+        query_vector = embed_response.data[0].embedding
+        vector_str = "[" + ",".join(map(str, query_vector)) + "]"
+
+        rows = await ToolRegistry._db.fetch(
+            """
+            SELECT chunk_text
+            FROM   kb_chunks
+            WHERE  persona_id = $1
+            ORDER  BY embedding <-> $2::vector
+            LIMIT  3;
+            """,
+            ToolRegistry._persona_id,
+            vector_str,
+        )
+        t2 = time.perf_counter()
+
+        # ── Results ───────────────────────────────────────────────────────────
+        print(f"Embed:    {t1 - t0:.3f}s")
+        print(f"pgvector: {t2 - t1:.3f}s")
+        print(f"Total:    {t2 - t0:.3f}s")
+        print(f"\nRAG result preview:\n")
+        for i, row in enumerate(rows, 1):
+            print(f"  Chunk {i}: {row['chunk_text'][:120]!r}")
+
+        await db_pool.close()
+        
     
 if __name__ == "__main__":
     asyncio.run(main())

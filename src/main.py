@@ -150,7 +150,7 @@ async def _stt_consumer(ctx: JobContext) -> None:
             _current_llm_task.cancel()
             _log(f"[{_ts()}] LLM         previous task cancelled")
         #Reset tts interupt flag so new response can be spoken
-        tts_pipeline.get_pipeline().reset_interrupt() ##TODO: to create the method
+        tts_pipeline.get_pipeline().reset_interrupt() 
         chat_ctx.add_message(role="user", content=utterance)
         _current_llm_task = asyncio.ensure_future(_generate_and_speak(chat_ctx))
 
@@ -293,7 +293,6 @@ async def _generate_and_speak(chat_ctx) -> None:
         raise
 
 
-# ─── Agent entrypoint ─────────────────────────────────────────────────────────
 
 async def _init_rag_database() -> None:
     """
@@ -317,6 +316,7 @@ async def _init_rag_database() -> None:
         _log(f"[{_ts()}] DB ERROR    failed to initialize database: {exc}")
         logger.error("Database initialization failed: %s", exc)
 
+# ─── Agent entrypoint ─────────────────────────────────────────────────────────
 
 async def my_agent(ctx: JobContext) -> None:
     """
