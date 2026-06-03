@@ -7,8 +7,8 @@ import json
 from dotenv import load_dotenv
 from livekit.agents import JobContext, JobProcess, WorkerOptions
 
-import tts_pipeline_v1 as tts_pipeline
-import stt_pipeline
+import tts_pipeline_v2 as tts_pipeline
+import stt_pipeline as stt_pipeline
 import tools
 from tools import execute_tool, TOOLS
 from livekit.agents import inference

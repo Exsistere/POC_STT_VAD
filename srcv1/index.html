@@ -1,0 +1,308 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>AgentAudioTrack — WebRTC Sink Test</title>
+<style>
+  *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+  body {
+    font-family: "SF Mono", "Fira Code", "Consolas", monospace;
+    background: #0d0d0d;
+    color: #e0e0e0;
+    min-height: 100vh;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    justify-content: center;
+    gap: 32px;
+    padding: 40px 20px;
+  }
+
+  h1 {
+    font-size: 13px;
+    letter-spacing: 0.15em;
+    text-transform: uppercase;
+    color: #555;
+    font-weight: 400;
+  }
+
+  /* ── Status indicator ── */
+  #status-wrap {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+  }
+
+  #dot {
+    width: 8px;
+    height: 8px;
+    border-radius: 50%;
+    background: #333;
+    transition: background 0.3s;
+    flex-shrink: 0;
+  }
+  #dot.connecting { background: #f5a623; animation: pulse 1s infinite; }
+  #dot.connected  { background: #4caf50; animation: none; }
+  #dot.error      { background: #e53935; animation: none; }
+
+  @keyframes pulse {
+    0%, 100% { opacity: 1; }
+    50%       { opacity: 0.3; }
+  }
+
+  #status {
+    font-size: 13px;
+    color: #888;
+    min-width: 260px;
+  }
+
+  /* ── Connect button ── */
+  button {
+    font-family: inherit;
+    font-size: 12px;
+    letter-spacing: 0.12em;
+    text-transform: uppercase;
+    padding: 12px 32px;
+    border: 1px solid #333;
+    background: transparent;
+    color: #ccc;
+    cursor: pointer;
+    border-radius: 2px;
+    transition: border-color 0.2s, color 0.2s;
+  }
+  button:hover:not(:disabled) { border-color: #888; color: #fff; }
+  button:disabled { opacity: 0.3; cursor: not-allowed; }
+
+  /* ── Log panel ── */
+  #log {
+    width: 100%;
+    max-width: 560px;
+    background: #111;
+    border: 1px solid #1e1e1e;
+    border-radius: 4px;
+    padding: 16px;
+    font-size: 11px;
+    line-height: 1.8;
+    color: #555;
+    min-height: 160px;
+    max-height: 280px;
+    overflow-y: auto;
+  }
+
+  #log .entry { color: #666; }
+  #log .entry.ok   { color: #4caf50; }
+  #log .entry.warn { color: #f5a623; }
+  #log .entry.err  { color: #e53935; }
+
+  /* ── Audio meter ── */
+  #meter-wrap {
+    display: flex;
+    align-items: center;
+    gap: 12px;
+    opacity: 0;
+    transition: opacity 0.4s;
+  }
+  #meter-wrap.visible { opacity: 1; }
+
+  #meter-label { font-size: 11px; color: #444; letter-spacing: 0.1em; text-transform: uppercase; }
+
+  #meter-bar {
+    width: 180px;
+    height: 3px;
+    background: #1a1a1a;
+    border-radius: 2px;
+    overflow: hidden;
+  }
+  #meter-fill {
+    height: 100%;
+    width: 0%;
+    background: #4caf50;
+    transition: width 0.05s linear;
+  }
+</style>
+</head>
+<body>
+
+<h1>AgentAudioTrack — WebRTC Sink Test</h1>
+
+<div id="status-wrap">
+  <div id="dot"></div>
+  <span id="status">Press connect to start</span>
+</div>
+
+<button id="btn" onclick="connect()">Connect</button>
+
+<div id="meter-wrap">
+  <span class="meter-label" id="meter-label">audio</span>
+  <div id="meter-bar"><div id="meter-fill"></div></div>
+</div>
+
+<div id="log"></div>
+
+<!-- Hidden audio element — receives the agent's WebRTC track -->
+<audio id="agent-audio" autoplay playsinline style="display:none"></audio>
+
+<script>
+  // ── State ────────────────────────────────────────────────────────────────
+  let pc = null;
+  let audioContext = null;
+  let analyser = null;
+  let meterRaf = null;
+
+  const btn        = document.getElementById("btn");
+  const dot        = document.getElementById("dot");
+  const statusEl   = document.getElementById("status");
+  const logEl      = document.getElementById("log");
+  const meterWrap  = document.getElementById("meter-wrap");
+  const meterFill  = document.getElementById("meter-fill");
+  const audioEl    = document.getElementById("agent-audio");
+
+  // ── Logging ──────────────────────────────────────────────────────────────
+  function log(msg, kind = "") {
+    const ts   = new Date().toLocaleTimeString("en-GB", { hour12: false, fractionalSecondDigits: 2 });
+    const div  = document.createElement("div");
+    div.className = `entry ${kind}`;
+    div.textContent = `${ts}  ${msg}`;
+    logEl.appendChild(div);
+    logEl.scrollTop = logEl.scrollHeight;
+    console.log(msg);
+  }
+
+  function setStatus(msg, state = "") {
+    statusEl.textContent = msg;
+    dot.className = state;
+  }
+
+  // ── Audio level meter (AnalyserNode on the received track) ───────────────
+  function startMeter(stream) {
+    try {
+      audioContext = new AudioContext();
+      const source = audioContext.createMediaStreamSource(stream);
+      analyser     = audioContext.createAnalyser();
+      analyser.fftSize = 256;
+      source.connect(analyser);
+
+      meterWrap.classList.add("visible");
+
+      const buf = new Uint8Array(analyser.frequencyBinCount);
+      function tick() {
+        analyser.getByteFrequencyData(buf);
+        const avg = buf.reduce((a, b) => a + b, 0) / buf.length;
+        meterFill.style.width = Math.min(100, avg * 2.5) + "%";
+        meterRaf = requestAnimationFrame(tick);
+      }
+      tick();
+    } catch (e) {
+      log("Meter init failed: " + e.message, "warn");
+    }
+  }
+
+  function stopMeter() {
+    if (meterRaf) cancelAnimationFrame(meterRaf);
+    if (audioContext) audioContext.close();
+    meterFill.style.width = "0%";
+    meterWrap.classList.remove("visible");
+  }
+
+  // ── WebRTC connect ────────────────────────────────────────────────────────
+  async function connect() {
+    btn.disabled = true;
+    setStatus("Creating peer connection…", "connecting");
+    log("Creating RTCPeerConnection");
+
+    pc = new RTCPeerConnection({
+      iceServers: [{ urls: "stun:stun.l.google.com:19302" }]
+    });
+
+    // We only need to receive audio — add a recvonly transceiver
+    pc.addTransceiver("audio", { direction: "recvonly" });
+
+    // ── Receive the agent's audio track ──────────────────────────────────
+    pc.ontrack = (event) => {
+      log(`Track received: kind=${event.track.kind}`, "ok");
+      setStatus("Track received — waiting for audio…", "connected");
+
+      const stream = event.streams[0] || new MediaStream([event.track]);
+      audioEl.srcObject = stream;
+
+      // Unmute and play (required on some browsers after autoplay policy)
+      audioEl.muted = false;
+      audioEl.play().catch(e => log("Autoplay blocked: " + e.message, "warn"));
+
+      startMeter(stream);
+
+      event.track.onunmute = () => {
+        log("Track unmuted — audio flowing", "ok");
+        setStatus("Audio flowing ✓", "connected");
+      };
+      event.track.onended = () => {
+        log("Track ended");
+        setStatus("Track ended", "");
+      };
+    };
+
+    // ── ICE state logging ─────────────────────────────────────────────────
+    pc.onicecandidate = (e) => {
+      if (e.candidate) log(`ICE candidate: ${e.candidate.type}`);
+    };
+
+    pc.oniceconnectionstatechange = () => {
+      log(`ICE state: ${pc.iceConnectionState}`,
+        pc.iceConnectionState === "connected" ? "ok" :
+        pc.iceConnectionState === "failed"    ? "err" : "");
+
+      if (pc.iceConnectionState === "connected") {
+        setStatus("ICE connected — TTS starting…", "connected");
+      }
+      if (pc.iceConnectionState === "failed") {
+        setStatus("ICE failed", "error");
+        btn.disabled = false;
+      }
+    };
+
+    pc.onconnectionstatechange = () => {
+      log(`Connection state: ${pc.connectionState}`,
+        pc.connectionState === "connected"     ? "ok"  :
+        pc.connectionState === "disconnected"  ? "warn" :
+        pc.connectionState === "failed"        ? "err"  : "");
+
+      if (pc.connectionState === "disconnected" || pc.connectionState === "failed") {
+        stopMeter();
+        btn.disabled = false;
+        setStatus("Disconnected", "error");
+      }
+    };
+
+    // ── Offer → backend → answer ──────────────────────────────────────────
+    try {
+      const offer = await pc.createOffer();
+      await pc.setLocalDescription(offer);
+      log("Offer created, sending to /offer…");
+      setStatus("Sending offer to server…", "connecting");
+
+      const res = await fetch("/offer", {
+        method:  "POST",
+        headers: { "Content-Type": "application/json" },
+        body:    JSON.stringify({ sdp: offer.sdp, type: offer.type }),
+      });
+
+      if (!res.ok) {
+        throw new Error(`Server returned ${res.status}: ${await res.text()}`);
+      }
+
+      const answer = await res.json();
+      log("Answer received from server", "ok");
+      await pc.setRemoteDescription(answer);
+      setStatus("Negotiating ICE…", "connecting");
+
+    } catch (err) {
+      log("Error: " + err.message, "err");
+      setStatus("Connection failed", "error");
+      btn.disabled = false;
+    }
+  }
+</script>
+</body>
+</html>

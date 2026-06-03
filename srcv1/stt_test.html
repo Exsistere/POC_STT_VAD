@@ -1,0 +1,364 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>STT Source Test — WebRTC</title>
+<style>
+  *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+  body {
+    font-family: "SF Mono", "Fira Code", "Consolas", monospace;
+    background: #0d0d0d;
+    color: #e0e0e0;
+    min-height: 100vh;
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    justify-content: center;
+    gap: 32px;
+    padding: 40px 20px;
+  }
+
+  h1 {
+    font-size: 13px;
+    letter-spacing: 0.15em;
+    text-transform: uppercase;
+    color: #555;
+    font-weight: 400;
+  }
+
+  #status-wrap {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+  }
+
+  #dot {
+    width: 8px;
+    height: 8px;
+    border-radius: 50%;
+    background: #333;
+    transition: background 0.3s;
+    flex-shrink: 0;
+  }
+  #dot.connecting { background: #f5a623; animation: pulse 1s infinite; }
+  #dot.connected  { background: #4caf50; animation: none; }
+  #dot.speaking   { background: #2196f3; animation: pulse 0.6s infinite; }
+  #dot.error      { background: #e53935; animation: none; }
+
+  @keyframes pulse {
+    0%, 100% { opacity: 1; }
+    50%       { opacity: 0.3; }
+  }
+
+  #status {
+    font-size: 13px;
+    color: #888;
+    min-width: 260px;
+  }
+
+  button {
+    font-family: inherit;
+    font-size: 12px;
+    letter-spacing: 0.12em;
+    text-transform: uppercase;
+    padding: 12px 32px;
+    border: 1px solid #333;
+    background: transparent;
+    color: #ccc;
+    cursor: pointer;
+    border-radius: 2px;
+    transition: border-color 0.2s, color 0.2s;
+  }
+  button:hover:not(:disabled) { border-color: #888; color: #fff; }
+  button:disabled { opacity: 0.3; cursor: not-allowed; }
+
+  /* ── Transcript panel ── */
+  #transcript-wrap {
+    width: 100%;
+    max-width: 560px;
+  }
+
+  #transcript-label {
+    font-size: 10px;
+    letter-spacing: 0.12em;
+    text-transform: uppercase;
+    color: #444;
+    margin-bottom: 8px;
+  }
+
+  #transcript {
+    width: 100%;
+    background: #111;
+    border: 1px solid #1e1e1e;
+    border-radius: 4px;
+    padding: 16px;
+    font-size: 13px;
+    line-height: 1.9;
+    color: #ccc;
+    min-height: 120px;
+    max-height: 240px;
+    overflow-y: auto;
+  }
+
+  .utterance {
+    padding: 4px 0;
+    border-bottom: 1px solid #1a1a1a;
+    color: #e0e0e0;
+  }
+  .utterance:last-child { border-bottom: none; }
+  .utterance .ts { color: #444; font-size: 11px; margin-right: 10px; }
+
+  /* ── Debug log ── */
+  #log {
+    width: 100%;
+    max-width: 560px;
+    background: #111;
+    border: 1px solid #1e1e1e;
+    border-radius: 4px;
+    padding: 16px;
+    font-size: 11px;
+    line-height: 1.8;
+    color: #555;
+    min-height: 120px;
+    max-height: 200px;
+    overflow-y: auto;
+  }
+
+  #log .entry { color: #666; }
+  #log .entry.ok   { color: #4caf50; }
+  #log .entry.warn { color: #f5a623; }
+  #log .entry.err  { color: #e53935; }
+
+  /* ── Mic level meter ── */
+  #meter-wrap {
+    display: flex;
+    align-items: center;
+    gap: 12px;
+    opacity: 0;
+    transition: opacity 0.4s;
+  }
+  #meter-wrap.visible { opacity: 1; }
+  #meter-label { font-size: 11px; color: #444; letter-spacing: 0.1em; text-transform: uppercase; }
+  #meter-bar {
+    width: 180px; height: 3px;
+    background: #1a1a1a; border-radius: 2px; overflow: hidden;
+  }
+  #meter-fill {
+    height: 100%; width: 0%;
+    background: #2196f3;
+    transition: width 0.05s linear;
+  }
+</style>
+</head>
+<body>
+
+<h1>STT Source Test — WebRTC</h1>
+
+<div id="status-wrap">
+  <div id="dot"></div>
+  <span id="status">Press connect to start</span>
+</div>
+
+<button id="btn" onclick="connect()">Connect &amp; Start Mic</button>
+
+<div id="meter-wrap">
+  <span id="meter-label">mic level</span>
+  <div id="meter-bar"><div id="meter-fill"></div></div>
+</div>
+
+<div id="transcript-wrap">
+  <div id="transcript-label">Transcripts</div>
+  <div id="transcript"><span style="color:#333">Transcripts will appear here…</span></div>
+</div>
+
+<div id="log"></div>
+
+<script>
+  // ── State ────────────────────────────────────────────────────────────────
+  let pc         = null;
+  let sse        = null;
+  let audioCtx   = null;
+  let analyser   = null;
+  let meterRaf   = null;
+  const connId   = crypto.randomUUID();   // stable per page load
+
+  const btn          = document.getElementById("btn");
+  const dot          = document.getElementById("dot");
+  const statusEl     = document.getElementById("status");
+  const logEl        = document.getElementById("log");
+  const transcriptEl = document.getElementById("transcript");
+  const meterWrap    = document.getElementById("meter-wrap");
+  const meterFill    = document.getElementById("meter-fill");
+
+  // ── Helpers ──────────────────────────────────────────────────────────────
+  function log(msg, kind = "") {
+    const ts  = new Date().toLocaleTimeString("en-GB", { hour12: false, fractionalSecondDigits: 2 });
+    const div = document.createElement("div");
+    div.className = `entry ${kind}`;
+    div.textContent = `${ts}  ${msg}`;
+    logEl.appendChild(div);
+    logEl.scrollTop = logEl.scrollHeight;
+    console.log(msg);
+  }
+
+  function setStatus(msg, state = "") {
+    statusEl.textContent = msg;
+    dot.className = state;
+  }
+
+  function addTranscript(text) {
+    // Clear placeholder on first real transcript
+    if (transcriptEl.querySelector("span")) {
+      transcriptEl.innerHTML = "";
+    }
+    const ts  = new Date().toLocaleTimeString("en-GB", { hour12: false });
+    const div = document.createElement("div");
+    div.className = "utterance";
+    div.innerHTML = `<span class="ts">${ts}</span>${text}`;
+    transcriptEl.appendChild(div);
+    transcriptEl.scrollTop = transcriptEl.scrollHeight;
+  }
+
+  // ── Mic meter ────────────────────────────────────────────────────────────
+  function startMicMeter(stream) {
+    try {
+      audioCtx = new AudioContext();
+      const src = audioCtx.createMediaStreamSource(stream);
+      analyser  = audioCtx.createAnalyser();
+      analyser.fftSize = 256;
+      src.connect(analyser);
+      meterWrap.classList.add("visible");
+      const buf = new Uint8Array(analyser.frequencyBinCount);
+      function tick() {
+        analyser.getByteFrequencyData(buf);
+        const avg = buf.reduce((a, b) => a + b, 0) / buf.length;
+        meterFill.style.width = Math.min(100, avg * 2.5) + "%";
+        meterRaf = requestAnimationFrame(tick);
+      }
+      tick();
+    } catch (e) {
+      log("Mic meter init failed: " + e.message, "warn");
+    }
+  }
+
+  // ── SSE: subscribe to transcripts from server ─────────────────────────────
+  function subscribeSSE() {
+    if (sse) sse.close();
+    sse = new EventSource(`/stt-transcript/${connId}`);
+
+    sse.onmessage = (e) => {
+      const data = JSON.parse(e.data);
+      if (data.status === "connected") {
+        log("SSE connected — ready for transcripts", "ok");
+      } else if (data.status === "closed") {
+        log("SSE stream closed by server");
+        setStatus("Session ended", "");
+        sse.close();
+      } else if (data.status === "no_session") {
+        log("Server: no STT session found for this connection", "warn");
+        sse.close();
+      } else if (data.utterance) {
+        log(`Utterance: ${data.utterance}`, "ok");
+        addTranscript(data.utterance);
+        setStatus("Listening…", "connected");
+      }
+    };
+
+    sse.onerror = () => {
+      log("SSE error / reconnecting…", "warn");
+    };
+  }
+
+  // ── WebRTC connect ────────────────────────────────────────────────────────
+  async function connect() {
+    btn.disabled = true;
+    setStatus("Requesting microphone…", "connecting");
+    log(`Connection ID: ${connId}`);
+
+    // Request mic access first
+    let micStream;
+    try {
+      micStream = await navigator.mediaDevices.getUserMedia({ audio: true, video: false });
+      log("Microphone access granted", "ok");
+    } catch (err) {
+      log("Mic access denied: " + err.message, "err");
+      setStatus("Microphone access denied", "error");
+      btn.disabled = false;
+      return;
+    }
+
+    startMicMeter(micStream);
+
+    // Subscribe to SSE before sending the offer so no transcripts are missed
+    subscribeSSE();
+
+    setStatus("Creating peer connection…", "connecting");
+    pc = new RTCPeerConnection({
+      iceServers: [{ urls: "stun:stun.l.google.com:19302" }]
+    });
+
+    // Add mic track as sendonly — server only receives, never sends back audio
+    micStream.getAudioTracks().forEach(track => {
+      pc.addTransceiver(track, { direction: "sendonly" });
+    });
+
+    pc.onicecandidate = (e) => {
+      if (e.candidate) log(`ICE candidate: ${e.candidate.type}`);
+    };
+
+    pc.oniceconnectionstatechange = () => {
+      log(`ICE state: ${pc.iceConnectionState}`,
+        pc.iceConnectionState === "connected" ? "ok"  :
+        pc.iceConnectionState === "failed"    ? "err" : "");
+      if (pc.iceConnectionState === "connected") {
+        setStatus("Listening… speak into your mic", "connected");
+      }
+      if (pc.iceConnectionState === "failed") {
+        setStatus("ICE failed", "error");
+        btn.disabled = false;
+      }
+    };
+
+    pc.onconnectionstatechange = () => {
+      log(`Connection state: ${pc.connectionState}`,
+        pc.connectionState === "connected"    ? "ok"  :
+        pc.connectionState === "disconnected" ? "warn" :
+        pc.connectionState === "failed"       ? "err"  : "");
+      if (pc.connectionState === "disconnected" || pc.connectionState === "failed") {
+        setStatus("Disconnected", "error");
+        btn.disabled = false;
+      }
+    };
+
+    try {
+      const offer = await pc.createOffer();
+      await pc.setLocalDescription(offer);
+      log("Offer created, sending to /stt-offer…");
+      setStatus("Sending offer to server…", "connecting");
+
+      const res = await fetch("/stt-offer", {
+        method:  "POST",
+        headers: { "Content-Type": "application/json" },
+        body:    JSON.stringify({ sdp: offer.sdp, type: offer.type, conn_id: connId }),
+      });
+
+      if (!res.ok) {
+        throw new Error(`Server returned ${res.status}: ${await res.text()}`);
+      }
+
+      const answer = await res.json();
+      log("Answer received", "ok");
+      await pc.setRemoteDescription(answer);
+      setStatus("Negotiating ICE…", "connecting");
+
+    } catch (err) {
+      log("Error: " + err.message, "err");
+      setStatus("Connection failed", "error");
+      btn.disabled = false;
+    }
+  }
+</script>
+</body>
+</html>
