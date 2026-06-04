@@ -87,26 +87,48 @@ CYAN  = "\033[36m"
 GREEN = "\033[32m"
 RESET = "\033[0m"
 
-# ─── TTS config ───────────────────────────────────────────────────────────────
+# ─── Latency tracking (use monotonic clock to avoid clock skew) ────────────────
+_latency_tracking: dict[tuple[str, int], float] = {}  # (stage, index) → start_time
 
-TTS_MODEL = "sonic-2"
-TTS_VOICE = "248be419-c632-4f23-adf1-5324ed7dbf1d"   # British Lady — neutral
-SD_QUEUE_MAXSIZE = 100
-
-
-# ─── Helpers ──────────────────────────────────────────────────────────────────
 
 def _ts() -> str:
     return datetime.now().strftime("%H:%M:%S.%f")[:-3]
 
 
+def _record_start(stage: str, index: int) -> None:
+    """Record the start time of a stage using monotonic clock."""
+    _latency_tracking[(stage, index)] = time.monotonic()
+
+
+def _compute_delta_ms(stage: str, index: int) -> str:
+    """
+    Compute delta in ms if start time exists, otherwise return empty string.
+    Removes the start time after computing to avoid memory leaks.
+    """
+    key = (stage, index)
+    if key not in _latency_tracking:
+        return ""
+    start_time = _latency_tracking.pop(key)
+    delta_ms = (time.monotonic() - start_time) * 1000
+    return f"  Δ{stage}={delta_ms:.0f}ms"
+
+
 def _log(message: str) -> None:
+    """
+    Atomic structured log to stdout.
+    Matches the visual style of the STT pipeline log_transcript().
+    """
     timestamp = datetime.now().strftime("%H:%M:%S.%f")[:-3]
     for line in message.split("\n"):
-        sys.stdout.write(
-            f"{CYAN}{timestamp}{RESET} {GREEN}INFO{RESET} tts_pipeline {line}\n"
-        )
+        sys.stdout.write(f"{CYAN}{timestamp}{RESET} {GREEN}INFO{RESET} tts_pipeline {line}\n")
     sys.stdout.flush()
+
+
+# ─── TTS config ───────────────────────────────────────────────────────────────
+
+TTS_MODEL = "sonic-3"
+TTS_VOICE = "248be419-c632-4f23-adf1-5324ed7dbf1d"   # British Lady — neutral
+SD_QUEUE_MAXSIZE = 100
 
 
 # ─── Output sink abstraction ──────────────────────────────────────────────────
@@ -391,11 +413,16 @@ class TTSPipeline:
         _log(f"[{_ts()}] INIT       sample_rate={sr}  num_channels={ch}")
         await self._sink.start(sr, ch)
 
-    async def speak(self, text: str) -> None:
+    async def speak(self, text: str, vad_start_time: float = 0.0, llm_start_time: float = 0.0) -> None:
         """
         Synthesise text and deliver audio through the active sink.
         Concurrent calls are serialised via _speak_lock.
         Barge-in cancels in-flight tasks immediately.
+        
+        Args:
+            text: Text to synthesize
+            vad_start_time: Monotonic timestamp of VAD START for e2e latency tracking
+            llm_start_time: Monotonic timestamp of first LLM chunk for llm_to_ttfa latency tracking
         """
         if self._interrupted:
             return
@@ -408,7 +435,7 @@ class TTSPipeline:
                 if self._interrupted:
                     return
                 self._speak_task = task
-                await self._synthesise_and_play(text)
+                await self._synthesise_and_play(text, vad_start_time, llm_start_time)
         finally:
             self._speak_tasks.discard(task)
 
@@ -464,7 +491,7 @@ class TTSPipeline:
 
     # ── Core synthesis ────────────────────────────────────────────────────────
 
-    async def _synthesise_and_play(self, text: str) -> None:
+    async def _synthesise_and_play(self, text: str, vad_start_time: float = 0.0, llm_start_time: float = 0.0) -> None:
         self._tts_index += 1
         idx           = self._tts_index
         start         = time.monotonic()
@@ -475,6 +502,9 @@ class TTSPipeline:
             f"┌─── TTS #{idx} START [{_ts()}] {'─' * 32}\n"
             f"│  [{_ts()}] TEXT       {text!r}"
         )
+        # Record start time for tts_dur latency tracking
+        _record_start("tts_dur", idx)
+        
         self._is_speaking = True
         self._sink.on_utterance_start()   # → mark_utterance_start() or no-op
 
@@ -487,14 +517,28 @@ class TTSPipeline:
                 if first_frame_t == 0.0:
                     first_frame_t = time.monotonic()
                     ttfa_ms       = (first_frame_t - start) * 1000
-                    _log(f"│  [{_ts()}] TTFA       {ttfa_ms:.0f}ms (text → first audio frame)")
+                    
+                    # Compute llm_to_ttfa delta if llm_start_time is provided
+                    llm_to_ttfa_delta = ""
+                    if llm_start_time > 0:
+                        llm_to_ttfa_ms = (first_frame_t - llm_start_time) * 1000
+                        llm_to_ttfa_delta = f"  Δllm_to_ttfa={llm_to_ttfa_ms:.0f}ms"
+                    
+                    # Compute e2e delta if vad_start_time is provided
+                    e2e_delta = ""
+                    if vad_start_time > 0:
+                        e2e_ms = (first_frame_t - vad_start_time) * 1000
+                        e2e_delta = f"  Δe2e={e2e_ms:.0f}ms"
+                    
+                    _log(f"│  [{_ts()}] TTFA       {ttfa_ms:.0f}ms (text → first audio frame){llm_to_ttfa_delta}{e2e_delta}")
 
                 await self._sink.send_frame(synthesised.frame)
                 frames_sent += 1
 
             elapsed_ms = (time.monotonic() - start) * 1000
+            tts_dur_delta = _compute_delta_ms("tts_dur", idx)
             _log(
-                f"│  [{_ts()}] DONE       frames={frames_sent}  total={elapsed_ms:.0f}ms\n"
+                f"│  [{_ts()}] DONE       frames={frames_sent}  total={elapsed_ms:.0f}ms{tts_dur_delta}\n"
                 f"└─── TTS #{idx} END   [{_ts()}] {'─' * 32}"
             )
 
@@ -504,8 +548,9 @@ class TTSPipeline:
                 self._sample_rate or 24000,
                 self._num_channels or 1,
             )
+            tts_dur_delta = _compute_delta_ms("tts_dur", idx)
             _log(
-                f"│  [{_ts()}] CANCELLED  frames_before_interrupt={frames_sent}\n"
+                f"│  [{_ts()}] CANCELLED  frames_before_interrupt={frames_sent}{tts_dur_delta}\n"
                 f"└─── TTS #{idx} INTERRUPTED [{_ts()}] {'─' * 24}"
             )
 
@@ -545,10 +590,10 @@ async def start_pipeline() -> None:
     await _pipeline.start()
 
 
-async def speak(text: str) -> None:
-    """Module-level speak — used by CLI main.py. Unchanged."""
+async def speak(text: str, vad_start_time: float = 0.0, llm_start_time: float = 0.0) -> None:
+    """Module-level speak — used by CLI main.py. Accepts optional latency tracking parameters."""
     assert _pipeline is not None, "call init_pipeline(ctx) first"
-    await _pipeline.speak(text)
+    await _pipeline.speak(text, vad_start_time, llm_start_time)
 
 
 def get_pipeline() -> TTSPipeline:

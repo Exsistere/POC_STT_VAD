@@ -56,9 +56,30 @@ BLUE  = "\033[34m"
 GREEN = "\033[32m"
 RESET = "\033[0m"
 
+# ─── Latency tracking (use monotonic clock to avoid clock skew) ────────────────
+_latency_tracking: dict[tuple[str, int], float] = {}  # (stage, index) → start_time
+
 
 def _ts() -> str:
     return datetime.now().strftime("%H:%M:%S.%f")[:-3]
+
+
+def _record_start(stage: str, index: int) -> None:
+    """Record the start time of a stage using monotonic clock."""
+    _latency_tracking[(stage, index)] = time.monotonic()
+
+
+def _compute_delta_ms(stage: str, index: int) -> str:
+    """
+    Compute delta in ms if start time exists, otherwise return empty string.
+    Removes the start time after computing to avoid memory leaks.
+    """
+    key = (stage, index)
+    if key not in _latency_tracking:
+        return ""
+    start_time = _latency_tracking.pop(key)
+    delta_ms = (time.monotonic() - start_time) * 1000
+    return f"  Δ{stage}={delta_ms:.0f}ms"
 
 
 def log_transcript(message: str) -> None:
@@ -125,6 +146,11 @@ class _UtteranceStateMachine:
         self._vad_ended         = False
         self._last_interim      = ""
         self._utterance_parts   = []
+        
+        # Record start time for vad_to_utt latency tracking and e2e tracking
+        _record_start("vad_to_utt", self._speech_index)
+        _record_start("e2e", self._speech_index)
+        
         log_transcript(
             f"┌─── SPEECH #{self._speech_index} START [{_ts()}] {'─' * 30}"
         )
@@ -160,9 +186,10 @@ class _UtteranceStateMachine:
         full = " ".join(self._utterance_parts).strip() or self._last_interim.strip()
         if full:
             e2e_ms = (self._first_final_time - self._speech_start_time) * 1000
+            vad_to_utt_delta = _compute_delta_ms("vad_to_utt", self._speech_index)
             log_transcript(
                 f"│  [{_ts()}] EOU        VAD\n"
-                f"│  [{_ts()}] UTTERANCE  {full}\n"
+                f"│  [{_ts()}] UTTERANCE  {full}{vad_to_utt_delta}\n"
                 f"│  [{_ts()}] E2E        {e2e_ms:.0f}ms (speech start → first final)\n"
                 f"└─── SPEECH #{self._speech_index} END   [{_ts()}] {'─' * 30}"
             )
@@ -247,9 +274,10 @@ class _LiveKitSource(_InputSource):
             full = " ".join(_utterance_parts).strip() or _last_interim.strip()
             if full:
                 e2e_ms = (_first_final_time - _speech_start_time) * 1000
+                vad_to_utt_delta = _compute_delta_ms("vad_to_utt", _speech_index)
                 log_transcript(
                     f"│  [{_ts()}] EOU        VAD\n"
-                    f"│  [{_ts()}] UTTERANCE  {full}\n"
+                    f"│  [{_ts()}] UTTERANCE  {full}{vad_to_utt_delta}\n"
                     f"│  [{_ts()}] E2E        {e2e_ms:.0f}ms (speech start → first final)\n"
                     f"└─── SPEECH #{_speech_index} END   [{_ts()}] {'─' * 30}"
                 )
@@ -284,6 +312,9 @@ class _LiveKitSource(_InputSource):
                 _vad_ended         = False
                 _last_interim      = ""
                 _utterance_parts   = []
+                # Record start time for vad_to_utt and e2e latency tracking
+                _record_start("vad_to_utt", _speech_index)
+                _record_start("e2e", _speech_index)
                 log_transcript(f"┌─── SPEECH #{_speech_index} START [{_ts()}] {'─' * 30}")
 
             elif event.new_state != "speaking" and _speech_active:
@@ -409,9 +440,10 @@ class _WebRTCSource(_InputSource):
             full = " ".join(_utterance_parts).strip() or _last_interim.strip()
             if full:
                 e2e_ms = (_first_final_time - _speech_start_time) * 1000
+                vad_to_utt_delta = _compute_delta_ms("vad_to_utt", _speech_index)
                 log_transcript(
                     f"│  [{_ts()}] EOU        VAD\n"
-                    f"│  [{_ts()}] UTTERANCE  {full}\n"
+                    f"│  [{_ts()}] UTTERANCE  {full}{vad_to_utt_delta}\n"
                     f"│  [{_ts()}] E2E        {e2e_ms:.0f}ms (speech start → first final)\n"
                     f"└─── SPEECH #{_speech_index} END   [{_ts()}] {'─' * 30}"
                 )
@@ -448,6 +480,9 @@ class _WebRTCSource(_InputSource):
             _vad_ended         = False
             _last_interim      = ""
             _utterance_parts   = []
+            # Record start time for vad_to_utt and e2e latency tracking
+            _record_start("vad_to_utt", _speech_index)
+            _record_start("e2e", _speech_index)
             log_transcript(
                 f"┌─── SPEECH #{_speech_index} START [{_ts()}] {'─' * 30}"
             )

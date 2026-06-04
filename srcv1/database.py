@@ -18,7 +18,8 @@ async def init_db_pool():
 
     db_pool = await asyncpg.create_pool(
         dsn,
-        ssl=ssl_ctx,
+        # ssl=ssl_ctx,
+        ssl = False,
         timeout=30,
         min_size=1,
         max_size=5,

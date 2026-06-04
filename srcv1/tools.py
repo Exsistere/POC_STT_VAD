@@ -101,9 +101,11 @@ TOOL_SCHEMAS: list[dict] = [
         "type": "function",
         "name": "search_knowledge_base",
         "description": (
-            "Search the company knowledge base to answer user questions about "
-            "pricing, services, policies, or technical details. "
-            "Call this WHENEVER the user asks a factual question you don't know."
+            "Search the company knowledge base. "
+            "Call this for ANY question about the Company — products, features, pricing, "
+            "integrations, use cases, company info, or anything the user wants to know. "
+            "This is your PRIMARY source of truth. Always call this before answering "
+            "factual questions, even if you think you already know the answer."
         ),
         "parameters": {
             "type": "object",
@@ -149,7 +151,13 @@ async def book_calendar_appointment(date: str, time: str) -> str:
 @llm.function_tool(raw_schema={
     "type": "function",
     "name": "search_knowledge_base",
-    "description": "Search the company knowledge base to answer user questions about pricing, services, policies, or technical details. Call this WHENEVER the user asks a factual question you don't know.",
+    "description": (
+            "Search the company knowledge base. "
+            "Call this for ANY question about the Company — products, features, pricing, "
+            "integrations, use cases, company info, or anything the user wants to know. "
+            "This is your PRIMARY source of truth. Always call this before answering "
+            "factual questions, even if you think you already know the answer."
+        ),
     "parameters": {
         "type": "object",
         "properties": {

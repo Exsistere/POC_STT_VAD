@@ -36,11 +36,11 @@ import os
 import sys
 from datetime import datetime
 from typing import Optional
-
+import time
 from dotenv import load_dotenv
 from livekit.agents import llm as agents_llm
 from livekit.agents.llm import FunctionCall, FunctionCallOutput
-from livekit.plugins import groq, openai
+from livekit.plugins import groq, openai, google, cerebras
 
 from tts import TTSPipeline
 from stt import STTPipeline
@@ -67,9 +67,36 @@ YELLOW = "\033[33m"
 GREEN  = "\033[32m"
 RESET  = "\033[0m"
 
+# ─── Latency tracking (use monotonic clock to avoid clock skew) ────────────────
+# Global dict: (key) → monotonic_time
+_latency_tracking: dict[str, float] = {}
+
 
 def _ts() -> str:
     return datetime.now().strftime("%H:%M:%S.%f")[:-3]
+
+
+def _record_start(key: str) -> None:
+    """Record the start time of a stage using monotonic clock."""
+    _latency_tracking[key] = time.monotonic()
+
+
+def _compute_delta_ms(key: str) -> float | None:
+    """
+    Compute delta in ms if start time exists, otherwise return None.
+    Removes the start time after computing to avoid memory leaks.
+    """
+    if key not in _latency_tracking:
+        return None
+    start_time = _latency_tracking.pop(key)
+    return (time.monotonic() - start_time) * 1000
+
+
+def _delta_str(name: str, ms: float | None) -> str:
+    """Format a single delta as ' Δname=Xms', or '' if None."""
+    if ms is None:
+        return ""
+    return f"  Δ{name}={ms:.0f}ms"
 
 
 def _log(message: str) -> None:
@@ -100,7 +127,7 @@ async def get_vad():
         _log(f"[{_ts()}] VAD         loading Silero (first call)...")
         _vad = silero.VAD.load(
             activation_threshold=0.4,
-            min_silence_duration=0.2,
+            min_silence_duration=0.08,
         )
         _log(f"[{_ts()}] VAD         loaded")
     return _vad
@@ -132,6 +159,12 @@ class _LLMClient:
             max_completion_tokens=int(os.getenv("LLM_MAX_TOKENS", "250")),
             temperature=float(os.getenv("LLM_TEMPERATURE", "0.3")),
         )
+        # self._llm = cerebras.LLM(
+        #     model=os.getenv("CEREBRAS_MODEL", "gpt-oss-120b"),
+        #     api_key=os.getenv("CEREBRAS_API_KEY"),
+        #     # max_completion_tokens=int(os.getenv("LLM_MAX_TOKENS", "250")),
+        #     temperature=float(os.getenv("LLM_TEMPERATURE", "0.3")),
+        # )
         # self._llm = openai.LLM.with_azure(
         #         azure_deployment=os.getenv("AZURE_DEPLOYMENT_NAME"),
         #         azure_endpoint=os.getenv("AZURE_OPENAI_ENDPOINT"),
@@ -141,10 +174,23 @@ class _LLMClient:
         #         temperature=0.3,
         #         max_completion_tokens=250,
         #     )
+        # self._llm = google.LLM(
+        #     model = "gemini-3.5-flash",
+        #     api_key = os.getenv("GEMINI_API_KEY"),
+        #     temperature = 0.2,
+        #     max_output_tokens = 250,
+        #     thinking_config={
+        #         "thinking_level": "low",  # disable thinking
+        #     },
+        #     automatic_function_calling_config = {
+        #         "disable": True,  # disable automatic function calling — we handle it ourselves in _generate_and_speak
+        #     }
+        # )
+        
     def chat(self, chat_ctx, tools):
         """Returns an async context manager that yields LLM chunks."""
         return self._llm.chat(chat_ctx=chat_ctx, tools=tools)
-
+        # return self._llm.chat(chat_ctx=chat_ctx,)
 
 # ─── PipelineOrchestrator ─────────────────────────────────────────────────────
 
@@ -177,6 +223,18 @@ class PipelineOrchestrator:
         self._llm = _LLMClient()
         self._chat_ctx: Optional[agents_llm.ChatContext] = None
         self._current_llm_task: Optional[asyncio.Task] = None
+        
+        # Latency tracking — per-orchestrator instance
+        self._turn_index = 0                      # increments on each utterance
+        self._round_index = 0                     # increments per LLM round within turn
+        self._tts_chunk_counter = 0               # increments per speak() call; resets each turn
+        self._tool_call_counter = 0               # increments per tool call
+        
+        # Timestamps for cross-file coordination (monotonic, in seconds)
+        self._vad_start_time: float = 0.0         # set by STT on UTTERANCE
+        self._vad_end_time: float = 0.0           # set by STT on UTTERANCE (captures latest VAD END)
+        self._utterance_time: float = 0.0         # set when UTTERANCE logged
+        self._llm_reply_time: float = 0.0         # set when LLM REPLY logged (for Δllm_to_ttfa)
 
     # ── Public entrypoint ─────────────────────────────────────────────────────
 
@@ -271,7 +329,14 @@ class PipelineOrchestrator:
         from global state to instance state.
         """
         async for utterance in self._stt.stream():
+            self._turn_index += 1
+            turn_idx = self._turn_index
             _log(f"[{_ts()}] STT RESULT  utterance received → {utterance!r}")
+            
+            # Record start time for utt_to_llm latency tracking
+            _record_start(f"utt_to_llm_{turn_idx}")
+            # Store for e2e tracking (will be passed to TTS)
+            self._vad_start_time = _latency_tracking.get(("vad_to_utt", turn_idx), time.monotonic())
 
             # Append to transcript
             self.call_transcript.append({"speaker": "User", "text": utterance})
@@ -287,12 +352,12 @@ class PipelineOrchestrator:
 
             self._chat_ctx.add_message(role="user", content=utterance)
             self._current_llm_task = asyncio.ensure_future(
-                self._generate_and_speak(self._chat_ctx)
+                self._generate_and_speak(self._chat_ctx, turn_idx)
             )
 
     # ── LLM streaming + TTS flush ─────────────────────────────────────────────
 
-    async def _generate_and_speak(self, chat_ctx) -> None:
+    async def _generate_and_speak(self, chat_ctx, turn_idx: int) -> None:
         """
         Streams the LLM response to TTS, handling tool calls in a loop.
 
@@ -332,13 +397,15 @@ class PipelineOrchestrator:
             text = buf.strip().lstrip(", ;:-")
             if text and not self._tts._interrupted:
                 _log(f"[{_ts()}] LLM STREAM  → {text!r}")
-                asyncio.ensure_future(self._tts.speak(text))
+                asyncio.ensure_future(self._tts.speak(text, vad_start_time=self._vad_start_time, llm_start_time=self._llm_start_time))
             return ""
 
         full_response = ""   # kept in scope for CancelledError handler
 
         try:
             for _round in range(MAX_TOOL_ROUNDS):
+                self._round_index = _round + 1
+                _log(f"[{_ts()}] LLM STREAM  starting round {self._round_index}")
                 sentence_buffer  = ""
                 full_response    = ""
                 first_chunk_sent = False
@@ -347,7 +414,17 @@ class PipelineOrchestrator:
                 # ── Stream one LLM turn ───────────────────────────────────
                 stream = self._llm.chat(chat_ctx, TOOLS)
                 async with stream:
+                    first_chunk = True
+                    first_chunk_time = time.perf_counter()
                     async for chunk in stream:
+                        if first_chunk:
+                            latency = time.perf_counter() - first_chunk_time
+                            # Record start time for llm_to_ttfa tracking (use monotonic)
+                            self._llm_start_time = time.monotonic()
+                            utt_to_llm_delta = _compute_delta_ms(f"utt_to_llm_{turn_idx}")
+                            _log(f"[{_ts()}] LLM STREAM  first chunk received after {latency:.2f}s")
+                            first_chunk = False
+                        # _log(f"[{_ts()}] LLM STREAM  chunk received → content={chunk.delta.content if chunk.delta and chunk.delta.content else ''}")
                         # Tool-call delta — merge fragments by call_id
                         if chunk.delta and chunk.delta.tool_calls:
                             for tc in chunk.delta.tool_calls:
@@ -396,25 +473,30 @@ class PipelineOrchestrator:
                     except json.JSONDecodeError:
                         args = {}
 
-                    _log(f"[{_ts()}] TOOL EXEC   {tc['name']}({args})")
-                    result = await execute_tool(tc["name"], args)
-                    _log(f"[{_ts()}] TOOL RESULT {tc['name']} → {result[:80]!r}")
+                    self._tool_call_counter += 1
+                    tool_idx = self._tool_call_counter
+                    tool_name = tc["name"]
+                    _record_start(f"tool_{tool_name}_{tool_idx}")
+                    _log(f"[{_ts()}] TOOL EXEC   {tool_name}({args})")
+                    result = await execute_tool(tool_name, args)
+                    tool_delta = _compute_delta_ms(f"tool_{tool_name}_{tool_idx}")
+                    _log(f"[{_ts()}] TOOL RESULT {tool_name} → {result[:80]!r}{tool_delta}")
 
                     # Record tool event — mirrors VoiceAgentManager.call_tools_used
                     self.call_tools_used.append({
-                        "type": tc["name"],
+                        "type": tool_name,
                         "data": {"args": args, "result": result},
                     })
 
                     # LiveKit ChatContext tool result API — unchanged from main.py
                     chat_ctx.insert(FunctionCall(
                         call_id=tc["id"],
-                        name=tc["name"],
+                        name=tool_name,
                         arguments=tc["arguments_str"] or "{}",
                     ))
                     chat_ctx.insert(FunctionCallOutput(
                         call_id=tc["id"],
-                        name=tc["name"],
+                        name=tool_name,
                         output=result,
                         is_error=False,
                     ))
@@ -424,7 +506,7 @@ class PipelineOrchestrator:
             # Exhausted MAX_TOOL_ROUNDS
             _log(f"[{_ts()}] TOOL LOOP   max rounds reached — aborting")
             asyncio.ensure_future(
-                self._tts.speak("Sorry, I'm having trouble completing that request.")
+                self._tts.speak("Sorry, I'm having trouble completing that request.", vad_start_time=self._vad_start_time, llm_start_time=self._llm_start_time)
             )
 
         except asyncio.CancelledError:
@@ -440,49 +522,51 @@ class PipelineOrchestrator:
         """
         Saves transcript and tool events to Postgres.
         Mirrors VoiceAgentManager.save_call_logs() exactly.
-        No-op if db is None or transcript is empty.
+        Acquires a connection from the pool for all DB operations, then releases it.
+        No-op if db_pool is None or transcript is empty.
         """
-        if not self.db:
+        if not self.db_pool:
             return
         if not self.call_transcript and not self.call_tools_used:
             return
 
         try:
-            call_id = await self.db.fetchval(
-                """
-                INSERT INTO calls (persona_id, duration_seconds)
-                VALUES ($1::uuid, 0) RETURNING id;
-                """,
-                self.persona_id,
-            )
-
-            if self.call_transcript:
-                transcript_data = [
-                    (call_id, t["speaker"], t["text"])
-                    for t in self.call_transcript
-                ]
-                await self.db.executemany(
+            async with self.db_pool.acquire() as conn:
+                call_id = await conn.fetchval(
                     """
-                    INSERT INTO call_transcripts (call_id, speaker, text)
-                    VALUES ($1, $2, $3)
+                    INSERT INTO calls (persona_id, duration_seconds)
+                    VALUES ($1::uuid, 0) RETURNING id;
                     """,
-                    transcript_data,
+                    self.persona_id,
                 )
 
-            if self.call_tools_used:
-                events_data = [
-                    (call_id, e["type"], json.dumps(e["data"]))
-                    for e in self.call_tools_used
-                ]
-                await self.db.executemany(
-                    """
-                    INSERT INTO call_events (call_id, event_type, event_data)
-                    VALUES ($1, $2, $3::jsonb)
-                    """,
-                    events_data,
-                )
+                if self.call_transcript:
+                    transcript_data = [
+                        (call_id, t["speaker"], t["text"])
+                        for t in self.call_transcript
+                    ]
+                    await conn.executemany(
+                        """
+                        INSERT INTO call_transcripts (call_id, speaker, text)
+                        VALUES ($1, $2, $3)
+                        """,
+                        transcript_data,
+                    )
 
-            _log(f"[{_ts()}] DB          call logs saved — call_id={call_id}")
+                if self.call_tools_used:
+                    events_data = [
+                        (call_id, e["type"], json.dumps(e["data"]))
+                        for e in self.call_tools_used
+                    ]
+                    await conn.executemany(
+                        """
+                        INSERT INTO call_events (call_id, event_type, event_data)
+                        VALUES ($1, $2, $3::jsonb)
+                        """,
+                        events_data,
+                    )
+
+                _log(f"[{_ts()}] DB          call logs saved — call_id={call_id}")
 
         except Exception as exc:
             logger.error(f"Failed to save call logs: {exc}")
