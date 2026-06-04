@@ -15,7 +15,7 @@ import threading
 from orchestrator import PipelineOrchestrator
 from agent_audio_track import AgentAudioTrack
 from routers import personas
-from database import init_db_pool, close_db_pool, get_db_connection
+from database import init_db_pool, close_db_pool, get_db_connection, get_db_pool
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("webrtc-agent")
@@ -126,7 +126,7 @@ async def offer(
             agent_manager = PipelineOrchestrator(
                 system_prompt=system_prompt,
                 agent_audio_track=agent_audio,
-                db_connection=db,
+                db_connection=get_db_pool(),
                 persona_id=request.persona_id,
             )
             asyncio.create_task(agent_manager.start(track))

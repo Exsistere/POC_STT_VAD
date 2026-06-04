@@ -595,7 +595,7 @@ class _WebRTCSource(_InputSource):
                         pcm_bytes = r_frame.to_ndarray().tobytes()
                         samples   = r_frame.samples
 
-                        # Send to Deepgram
+                        # Send to Deepgram ##TODO: send only if VAD detects speech? But then we lose context for Deepgram's endpointing logic. Maybe send all but mark non-speech frames with a flag?
                         try:
                             await dg_ws.send(pcm_bytes)
                         except Exception as exc:

@@ -126,21 +126,21 @@ class _LLMClient:
     """
 
     def __init__(self) -> None:
-        # self._llm = groq.LLM(
-        #     model=os.getenv("GROQ_MODEL", "openai/gpt-oss-120b"),
-        #     api_key=os.getenv("GROQ_API_KEY"),
-        #     max_completion_tokens=int(os.getenv("LLM_MAX_TOKENS", "250")),
-        #     temperature=float(os.getenv("LLM_TEMPERATURE", "0.3")),
-        # )
-        self._llm = openai.LLM.with_azure(
-                azure_deployment=os.getenv("AZURE_DEPLOYMENT_NAME"),
-                azure_endpoint=os.getenv("AZURE_OPENAI_ENDPOINT"),
-                api_key=os.getenv("AZURE_OPENAI_API_KEY"),
-                api_version=os.getenv("OPENAI_API_VERSION"),
-                model="openai/gpt-oss-120b",
-                temperature=0.3,
-                max_completion_tokens=250,
-            )
+        self._llm = groq.LLM(
+            model=os.getenv("GROQ_MODEL", "openai/gpt-oss-120b"),
+            api_key=os.getenv("GROQ_API_KEY"),
+            max_completion_tokens=int(os.getenv("LLM_MAX_TOKENS", "250")),
+            temperature=float(os.getenv("LLM_TEMPERATURE", "0.3")),
+        )
+        # self._llm = openai.LLM.with_azure(
+        #         azure_deployment=os.getenv("AZURE_DEPLOYMENT_NAME"),
+        #         azure_endpoint=os.getenv("AZURE_OPENAI_ENDPOINT"),
+        #         api_key=os.getenv("AZURE_OPENAI_API_KEY"),
+        #         api_version=os.getenv("OPENAI_API_VERSION"),
+        #         model="openai/gpt-oss-120b",
+        #         temperature=0.3,
+        #         max_completion_tokens=250,
+        #     )
     def chat(self, chat_ctx, tools):
         """Returns an async context manager that yields LLM chunks."""
         return self._llm.chat(chat_ctx=chat_ctx, tools=tools)
@@ -164,7 +164,7 @@ class PipelineOrchestrator:
         self.system_prompt    = system_prompt
         self.agent_audio_track = agent_audio_track
         self.persona_id       = persona_id
-        self.db               = db_connection
+        self.db_pool          = db_connection
         self.language_code    = language_code
 
         # Call record — mirrors VoiceAgentManager
@@ -222,7 +222,7 @@ class PipelineOrchestrator:
 
             # 6. ToolRegistry — per-call so persona_id is scoped correctly
             from tools import ToolRegistry
-            ToolRegistry.init(db_connection=self.db, persona_id=self.persona_id)
+            ToolRegistry.init(db_connection=self.db_pool, persona_id=self.persona_id)
             _log(f"[{_ts()}] TOOLS       ToolRegistry initialized for persona={self.persona_id}")
 
             _log(f"[{_ts()}] ORCHESTRATOR running — waiting for utterances")

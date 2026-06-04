@@ -39,7 +39,7 @@ class ToolRegistry:
     Call ToolRegistry.init() once at agent startup before any tool is executed.
     """
 
-    _db          = None
+    _db_pool     = None
     _persona_id  : str = "default-persona"
     _embed_client: AsyncAzureOpenAI | None = None
     _embed_model : str = ""
@@ -53,7 +53,7 @@ class ToolRegistry:
             db_connection : asyncpg pool or connection already open.
             persona_id    : the persona whose KB chunks to query.
         """
-        cls._db         = db_connection
+        cls._db_pool    = db_connection
         cls._persona_id = persona_id
         cls._embed_client = AsyncAzureOpenAI(
             azure_endpoint=os.getenv("AZURE_EMBEDDING_ENDPOINT"),
@@ -170,7 +170,7 @@ async def search_knowledge_base(query: str) -> str:
     """
     reg = ToolRegistry  # shorthand
 
-    if reg._db is None or reg._embed_client is None:
+    if reg._db_pool is None or reg._embed_client is None:
         logger.error("ToolRegistry.init() was never called — cannot execute RAG tool.")
         return "The knowledge base is temporarily unavailable. Please let the user know."
 
@@ -183,30 +183,31 @@ async def search_knowledge_base(query: str) -> str:
         query_vector = embed_response.data[0].embedding
         vector_str   = "[" + ",".join(map(str, query_vector)) + "]"
 
-        # 2. Vector similarity search
-        rows = await reg._db.fetch(
-            """
-            SELECT chunk_text
-            FROM   kb_chunks
-            WHERE  persona_id = $1
-            ORDER  BY embedding <-> $2::vector
-            LIMIT  3;
-            """,
-            reg._persona_id,
-            vector_str,
-        )
-
-        # 3. Build context string
-        if rows:
-            extracted = "\n\n".join(row["chunk_text"] for row in rows)
-            logger.info("RAG: found %d chunks for query %r", len(rows), query[:60])
-            return (
-                "Here is the relevant context from the knowledge base:\n"
-                f"{extracted}\n\n"
-                "Use this to answer the user naturally."
+        # 2. Vector similarity search — acquire connection from pool, use, and release
+        async with reg._db_pool.acquire() as conn:
+            rows = await conn.fetch(
+                """
+                SELECT chunk_text
+                FROM   kb_chunks
+                WHERE  persona_id = $1
+                ORDER  BY embedding <-> $2::vector
+                LIMIT  3;
+                """,
+                reg._persona_id,
+                vector_str,
             )
-        else:
-            return "No relevant information found in the knowledge base. Inform the user gracefully."
+
+            # 3. Build context string
+            if rows:
+                extracted = "\n\n".join(row["chunk_text"] for row in rows)
+                logger.info("RAG: found %d chunks for query %r", len(rows), query[:60])
+                return (
+                    "Here is the relevant context from the knowledge base:\n"
+                    f"{extracted}\n\n"
+                    "Use this to answer the user naturally."
+                )
+            else:
+                return "No relevant information found in the knowledge base. Inform the user gracefully."
 
     except Exception as exc:
         logger.error("Vector search failed: %s", exc)

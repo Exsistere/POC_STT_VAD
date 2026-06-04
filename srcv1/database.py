@@ -34,3 +34,7 @@ async def get_db_connection() -> AsyncGenerator[asyncpg.Connection, None]:
     global db_pool
     async with db_pool.acquire() as connection:
         yield connection
+
+def get_db_pool():
+    """Returns the module-level db_pool object for long-lived operations."""
+    return db_pool
