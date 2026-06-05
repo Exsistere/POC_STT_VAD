@@ -21,7 +21,7 @@ import logging
 import os
 from openai import AsyncAzureOpenAI
 import asyncpg
-from livekit.agents import llm
+# livekit.agents.llm import removed — TOOLS is now plain OpenAI JSON schema
 from dotenv import load_dotenv
 import time
 load_dotenv(override=True) 
@@ -77,45 +77,49 @@ class ToolRegistry:
 TOOL_SCHEMAS: list[dict] = [
     {
         "type": "function",
-        "name": "book_calendar_appointment",
-        "description": (
-            "Book a car service pickup appointment for the user. "
-            "Call this when the user agrees on a specific date and time."
-        ),
-        "parameters": {
-            "type": "object",
-            "properties": {
-                "date": {
-                    "type": "string",
-                    "description": "Date of appointment, e.g. '2026-05-27'",
+        "function": {
+            "name": "book_calendar_appointment",
+            "description": (
+                "Book a car service pickup appointment for the user. "
+                "Call this when the user agrees on a specific date and time."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "date": {
+                        "type": "string",
+                        "description": "Date of appointment, e.g. '2026-05-27'",
+                    },
+                    "time": {
+                        "type": "string",
+                        "description": "Time of appointment, e.g. '09:30 AM'",
+                    },
                 },
-                "time": {
-                    "type": "string",
-                    "description": "Time of appointment, e.g. '09:30 AM'",
-                },
+                "required": ["date", "time"],
             },
-            "required": ["date", "time"],
         },
     },
     {
         "type": "function",
-        "name": "search_knowledge_base",
-        "description": (
-            "Search the company knowledge base. "
-            "Call this for ANY question about the Company — products, features, pricing, "
-            "integrations, use cases, company info, or anything the user wants to know. "
-            "This is your PRIMARY source of truth. Always call this before answering "
-            "factual questions, even if you think you already know the answer."
-        ),
-        "parameters": {
-            "type": "object",
-            "properties": {
-                "query": {
-                    "type": "string",
-                    "description": "The exact question the user asked, formulated as a search query.",
+        "function": {
+            "name": "search_knowledge_base",
+            "description": (
+                "Search the company knowledge base. "
+                "Call this for ANY question about the Company — products, features, pricing, "
+                "integrations, use cases, company info, or anything the user wants to know. "
+                "This is your PRIMARY source of truth. Always call this before answering "
+                "factual questions, even if you think you already know the answer."
+            ),
+            "parameters": {
+                "type": "object",
+                "properties": {
+                    "query": {
+                        "type": "string",
+                        "description": "The exact question the user asked, formulated as a search query.",
+                    },
                 },
+                "required": ["query"],
             },
-            "required": ["query"],
         },
     },
 ]
@@ -123,52 +127,12 @@ TOOL_SCHEMAS: list[dict] = [
 
 # ─── Individual tool implementations ─────────────────────────────────────────
 
-@llm.function_tool(raw_schema={
-    "type": "function",
-    "name": "book_calendar_appointment",
-    "description": "Book a car service pickup appointment for the user. Call this when the user agrees on a specific date and time.",
-    "parameters": {
-        "type": "object",
-        "properties": {
-            "date": {
-                "type": "string",
-                "description": "Date of appointment, e.g. '2026-05-27'",
-            },
-            "time": {
-                "type": "string",
-                "description": "Time of appointment, e.g. '09:30 AM'",
-            },
-        },
-        "required": ["date", "time"],
-    },
-})
 async def book_calendar_appointment(date: str, time: str) -> str:
     """Simulated calendar booking. Replace with your real calendar API call."""
     await asyncio.sleep(1)  # simulate network round-trip
     return f"Success! Appointment booked for {date} at {time}."
 
 
-@llm.function_tool(raw_schema={
-    "type": "function",
-    "name": "search_knowledge_base",
-    "description": (
-            "Search the company knowledge base. "
-            "Call this for ANY question about the Company — products, features, pricing, "
-            "integrations, use cases, company info, or anything the user wants to know. "
-            "This is your PRIMARY source of truth. Always call this before answering "
-            "factual questions, even if you think you already know the answer."
-        ),
-    "parameters": {
-        "type": "object",
-        "properties": {
-            "query": {
-                "type": "string",
-                "description": "The exact question the user asked, formulated as a search query.",
-            },
-        },
-        "required": ["query"],
-    },
-})
 async def search_knowledge_base(query: str) -> str:
     """
     RAG retrieval:
@@ -222,12 +186,12 @@ async def search_knowledge_base(query: str) -> str:
         return "The knowledge base is temporarily unavailable. Please let the user know."
 
 
-# ─── Tool definition for LLM (wrapped with @function_tool decorator) ──────────
+# ─── Tool schemas for LLM (OpenAI / Groq wire format) ────────────────────────
+# TOOLS is the list passed to the LLM's tools parameter.
+# Each entry follows the OpenAI function-calling schema.
+# TOOL_SCHEMAS (defined above) is already in the correct format.
 
-TOOLS: list[llm.Tool] = [
-    book_calendar_appointment,
-    search_knowledge_base,
-]
+TOOLS: list[dict] = TOOL_SCHEMAS
 
 
 # ─── Dispatcher ───────────────────────────────────────────────────────────────

@@ -12,6 +12,7 @@ dependencies = [
     "dotenv>=0.9.9",
     "fastapi>=0.136.3",
     "google-genai>=2.7.0",
+    "httpx>=0.27.0",
     "livekit-agents[cerebras,google]~=1.5.2",
     "livekit-plugins-ai-coustics>=0.2.15",
     "livekit-plugins-azure>=1.5.12",

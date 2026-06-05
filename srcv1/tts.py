@@ -383,6 +383,9 @@ class TTSPipeline:
         self._speak_lock  = asyncio.Lock()
         self._speak_tasks: set[asyncio.Task] = set()
         self._tts_index   = 0
+        # Problem 3 — logging fix: track which TTS index starts each new turn
+        # so Δllm_to_ttfa is only logged on the first speak() per turn.
+        self._tts_turn_start_index = 1
 
         self._is_speaking    = False
         self._interrupted    = False
@@ -461,6 +464,9 @@ class TTSPipeline:
     def reset_interrupt(self) -> None:
         """Clear interrupt flag before processing a new utterance."""
         self._interrupted = False
+        # Problem 3 — logging fix: the next speak() call after a turn-start
+        # is the first chunk for this turn. Mark its expected index now.
+        self._tts_turn_start_index = self._tts_index + 1
 
     @property
     def is_speaking(self) -> bool:
@@ -518,9 +524,11 @@ class TTSPipeline:
                     first_frame_t = time.monotonic()
                     ttfa_ms       = (first_frame_t - start) * 1000
                     
-                    # Compute llm_to_ttfa delta if llm_start_time is provided
+                    # Compute llm_to_ttfa delta only for the first speak() of this turn.
+                    # Subsequent chunks from split responses have inflated deltas because
+                    # they queue behind _speak_lock while chunk 1 synthesises.
                     llm_to_ttfa_delta = ""
-                    if llm_start_time > 0:
+                    if llm_start_time > 0 and idx == self._tts_turn_start_index:
                         llm_to_ttfa_ms = (first_frame_t - llm_start_time) * 1000
                         llm_to_ttfa_delta = f"  Δllm_to_ttfa={llm_to_ttfa_ms:.0f}ms"
                     

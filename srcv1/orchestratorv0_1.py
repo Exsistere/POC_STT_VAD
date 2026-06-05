@@ -17,8 +17,8 @@ What it owns per call
 ─────────────────────
 • TTSPipeline (WebRTC sink → AgentAudioTrack)
 • STTPipeline (WebRTC source ← browser mic track)
-• LLM client  (direct Groq httpx SSE — no LiveKit plugin intermediary)
-• _ChatContext (message history for the duration of the call)
+• LLM client  (LiveKit groq.LLM — abstracted behind _LLMClient for future swaps)
+• ChatContext  (message history for the duration of the call)
 • ToolRegistry (per-call instance with db_connection + persona_id)
 • call_transcript list (mirrors VoiceAgentManager.call_transcript)
 • call_tools_used list (mirrors VoiceAgentManager.call_tools_used)
@@ -30,17 +30,17 @@ No app.state dependency.
 """
 
 import asyncio
-import re
 import json
 import logging
 import os
 import sys
-from dataclasses import dataclass
 from datetime import datetime
-from typing import Any, Optional
+from typing import Optional
 import time
-import httpx
 from dotenv import load_dotenv
+from livekit.agents import llm as agents_llm
+from livekit.agents.llm import FunctionCall, FunctionCallOutput
+from livekit.plugins import groq, openai, google, cerebras
 
 from tts import TTSPipeline
 from stt import STTPipeline
@@ -133,264 +133,64 @@ async def get_vad():
     return _vad
 
 
-# ─── LLM chunk data classes ────────────────────────────────────────────────────
-# Mirror the shape that _generate_and_speak already expects from the LiveKit
-# plugin — same attribute paths, zero external dependency.
-
-@dataclass
-class _ToolCallDelta:
-    call_id:   str
-    name:      str | None
-    arguments: str | None   # partial JSON fragment
-
-
-@dataclass
-class _ChunkDelta:
-    content:    str | None = None
-    tool_calls: list[_ToolCallDelta] | None = None
-
-
-@dataclass
-class _Chunk:
-    delta: _ChunkDelta
-
-
-# ─── _ChatContext — drop-in replacement for livekit.agents.llm.ChatContext ─────
-
-class _ChatContext:
-    """
-    Minimal conversation history store.
-    Messages are kept as Groq-compatible dicts from the moment they are added —
-    no serialization step needed when sending to the API.
-
-    Replaces livekit.agents.llm.ChatContext. Same call sites, same behaviour,
-    zero external dependency.
-
-    Groq wire format reference:
-      system/user/assistant : {"role": "...", "content": "..."}
-      assistant + tool call : {"role": "assistant", "content": None,
-                               "tool_calls": [{"id": ..., "type": "function",
-                                               "function": {"name": ..., "arguments": ...}}]}
-      tool result           : {"role": "tool", "tool_call_id": ..., "content": ...}
-
-    NOTE — Groq rejects messages[].name (causes HTTP 400). Never add a "name"
-    key to any message dict. The tool result message intentionally omits it.
-    """
-
-    def __init__(self) -> None:
-        self._messages: list[dict] = []
-
-    @property
-    def messages(self) -> list[dict]:
-        """Read-only view consumed by _LLMClient.chat()."""
-        return self._messages
-
-    def add_message(self, *, role: str, content: str) -> None:
-        """Append a system, user, or plain assistant message."""
-        self._messages.append({"role": role, "content": content})
-
-    def add_tool_call(
-        self,
-        *,
-        call_id:   str,
-        name:      str,
-        arguments: str,      # JSON string from the streaming accumulator
-    ) -> None:
-        """
-        Append an assistant message that represents a tool invocation.
-        Must be called BEFORE add_tool_result() for the same call_id.
-        Groq enforces: role=tool must be immediately preceded by the
-        role=assistant message containing its tool_calls entry.
-        """
-        self._messages.append({
-            "role":    "assistant",
-            "content": None,
-            "tool_calls": [{
-                "id":   call_id,
-                "type": "function",
-                "function": {
-                    "name":      name,
-                    "arguments": arguments,
-                },
-            }],
-        })
-
-    def add_tool_result(
-        self,
-        *,
-        call_id: str,
-        content: str,
-    ) -> None:
-        """
-        Append a tool result message.
-        Must be called immediately after add_tool_call() for the same call_id.
-        Omits 'name' — Groq returns HTTP 400 if messages[].name is present.
-        """
-        self._messages.append({
-            "role":         "tool",
-            "tool_call_id": call_id,
-            "content":      content,
-        })
-
-
-# ─── _GroqStream — raw httpx SSE stream ───────────────────────────────────────
-
-class _GroqStream:
-    """
-    Async context manager + async iterator that wraps a streaming httpx response
-    and yields _Chunk objects compatible with the existing _generate_and_speak loop.
-
-    Key design: self._lines is the single aiter_lines() generator created once in
-    __aenter__. __anext__ advances it one SSE event at a time via anext(). Never
-    re-create the generator — doing so causes httpx.StreamConsumed on the second chunk.
-    """
-
-    def __init__(self, messages: list[dict], tools: list[dict] | None, config: dict) -> None:
-        self._messages = messages
-        self._tools    = tools
-        self._config   = config
-        self._client:      httpx.AsyncClient | None = None
-        self._request_ctx = None
-        self._lines    = None   # single aiter_lines() iterator — created once in __aenter__
-        self._tc_id_by_index: dict[int, str] = {}
-
-    async def __aenter__(self) -> "_GroqStream":
-        self._client = httpx.AsyncClient(
-            timeout=httpx.Timeout(connect=5.0, read=30.0, write=10.0, pool=5.0)
-        )
-        # Do NOT call self._client.__aenter__() — it serves no purpose for a
-        # single-request client and can interfere with streaming behaviour.
-
-        payload: dict[str, Any] = {
-            "model":       self._config["model"],
-            "messages":    self._messages,
-            # "max_tokens":  self._config["max_tokens"],
-            "temperature": self._config["temperature"],
-            "stream":      True,
-        }
-        if self._tools:
-            payload["tools"]       = self._tools
-            payload["tool_choice"] = "auto"
-
-        try:
-            self._request_ctx = self._client.stream(
-                method="POST",
-                url="https://api.groq.com/openai/v1/chat/completions",
-                headers={
-                    "Authorization": f"Bearer {self._config['api_key']}",
-                    "Content-Type":  "application/json",
-                },
-                json=payload,
-            )
-            response = await self._request_ctx.__aenter__()
-            response.raise_for_status()
-            # Create the line iterator ONCE here — __anext__ will advance it
-            self._lines = response.aiter_lines()
-        except Exception:
-            # Clean up client if we never fully entered — __aexit__ won't be called
-            await self._client.aclose()
-            raise
-
-        return self
-
-    async def __aexit__(self, *args) -> None:
-        if self._request_ctx:
-            try:
-                await self._request_ctx.__aexit__(*args)
-            except httpx.HTTPError:
-                pass
-        if self._client:
-            await self._client.aclose()
-
-    def __aiter__(self) -> "_GroqStream":
-        return self
-
-    async def __anext__(self) -> _Chunk:
-        """
-        Advance the persistent aiter_lines() iterator one SSE event at a time.
-        Skips empty lines and non-data lines. Raises StopAsyncIteration on [DONE]
-        or when the stream is exhausted.
-        """
-        while True:
-            try:
-                raw_line = await self._lines.__anext__()
-            except StopAsyncIteration:
-                raise   # stream ended cleanly
-
-            line = raw_line.strip()
-            if not line or not line.startswith("data:"):
-                continue
-
-            data = line[len("data:"):].strip()
-            if data == "[DONE]":
-                raise StopAsyncIteration
-
-            try:
-                event = json.loads(data)
-            except json.JSONDecodeError:
-                continue
-
-            choices = event.get("choices")
-            if not choices:
-                continue
-
-            delta_raw = choices[0].get("delta", {})
-
-            # ── Text content ──────────────────────────────────────────────────
-            content = delta_raw.get("content") or None
-
-            # ── Tool calls ────────────────────────────────────────────────────
-            tool_calls: list[_ToolCallDelta] | None = None
-            raw_tcs = delta_raw.get("tool_calls")
-            if raw_tcs:
-                tool_calls = []
-                for tc in raw_tcs:
-                    idx     = tc.get("index", 0)
-                    call_id = tc.get("id") or self._tc_id_by_index.get(idx, "")
-                    if tc.get("id"):
-                        self._tc_id_by_index[idx] = tc["id"]
-                    func = tc.get("function", {})
-                    tool_calls.append(_ToolCallDelta(
-                        call_id   = call_id,
-                        name      = func.get("name") or None,
-                        arguments = func.get("arguments") or None,
-                    ))
-
-            return _Chunk(delta=_ChunkDelta(content=content, tool_calls=tool_calls))
-
 # ─── LLM abstraction ──────────────────────────────────────────────────────────
+# Thin wrapper around the LiveKit groq.LLM plugin.
+# To switch to direct Groq SDK or Azure: replace _LLMClient internals only.
+# _generate_and_speak calls self._llm.chat(chat_ctx, tools) — that contract
+# must be preserved by any future implementation.
 
 class _LLMClient:
     """
-    Direct Groq API client via httpx SSE streaming.
-    Replaces livekit.plugins.groq.LLM — same external contract, lower latency.
+    Abstracts the LLM provider.
+    Currently wraps livekit.plugins.groq.LLM.
 
-    _generate_and_speak calls self._llm.chat(chat_ctx, tools) — that contract
-    is preserved:
-        async with client.chat(chat_ctx, tools) as stream:
+    Future swap point: replace __init__ and chat() internals without touching
+    _generate_and_speak. The returned object must support:
+        async with client.chat(chat_ctx=..., tools=...) as stream:
             async for chunk in stream:
                 chunk.delta.content     # str | None
                 chunk.delta.tool_calls  # list | None
     """
 
     def __init__(self) -> None:
-        self._config = {
-            "model":       os.getenv("GROQ_MODEL", "openai/gpt-oss-120b"),
-            "api_key":     os.getenv("GROQ_API_KEY", ""),
-            "max_tokens":  int(os.getenv("LLM_MAX_TOKENS", "250")),
-            "temperature": float(os.getenv("LLM_TEMPERATURE", "0.3")),
-        }
-
-    def chat(self, chat_ctx: "_ChatContext", tools: list[dict] | None) -> _GroqStream:
-        """
-        Returns a _GroqStream async context manager.
-        chat_ctx._messages is already in Groq wire format — passed through directly.
-        """
-        return _GroqStream(
-            messages=chat_ctx.messages,   # already Groq-compatible dicts — no conversion
-            tools=tools or None,
-            config=self._config,
+        self._llm = groq.LLM(
+            model=os.getenv("GROQ_MODEL", "openai/gpt-oss-120b"),
+            api_key=os.getenv("GROQ_API_KEY"),
+            max_completion_tokens=int(os.getenv("LLM_MAX_TOKENS", "250")),
+            temperature=float(os.getenv("LLM_TEMPERATURE", "0.3")),
         )
+        # self._llm = cerebras.LLM(
+        #     model=os.getenv("CEREBRAS_MODEL", "gpt-oss-120b"),
+        #     api_key=os.getenv("CEREBRAS_API_KEY"),
+        #     # max_completion_tokens=int(os.getenv("LLM_MAX_TOKENS", "250")),
+        #     temperature=float(os.getenv("LLM_TEMPERATURE", "0.3")),
+        # )
+        # self._llm = openai.LLM.with_azure(
+        #         azure_deployment=os.getenv("AZURE_DEPLOYMENT_NAME"),
+        #         azure_endpoint=os.getenv("AZURE_OPENAI_ENDPOINT"),
+        #         api_key=os.getenv("AZURE_OPENAI_API_KEY"),
+        #         api_version=os.getenv("OPENAI_API_VERSION"),
+        #         model="openai/gpt-oss-120b",
+        #         temperature=0.3,
+        #         max_completion_tokens=250,
+        #     )
+        # self._llm = google.LLM(
+        #     model = "gemini-3.5-flash",
+        #     api_key = os.getenv("GEMINI_API_KEY"),
+        #     temperature = 0.2,
+        #     max_output_tokens = 250,
+        #     thinking_config={
+        #         "thinking_level": "low",  # disable thinking
+        #     },
+        #     automatic_function_calling_config = {
+        #         "disable": True,  # disable automatic function calling — we handle it ourselves in _generate_and_speak
+        #     }
+        # )
+        
+    def chat(self, chat_ctx, tools):
+        """Returns an async context manager that yields LLM chunks."""
+        return self._llm.chat(chat_ctx=chat_ctx, tools=tools)
+        # return self._llm.chat(chat_ctx=chat_ctx,)
 
 # ─── PipelineOrchestrator ─────────────────────────────────────────────────────
 
@@ -421,7 +221,7 @@ class PipelineOrchestrator:
         self._tts: Optional[TTSPipeline]  = None
         self._stt: Optional[STTPipeline]  = None
         self._llm = _LLMClient()
-        self._chat_ctx: Optional[_ChatContext] = None
+        self._chat_ctx: Optional[agents_llm.ChatContext] = None
         self._current_llm_task: Optional[asyncio.Task] = None
         
         # Latency tracking — per-orchestrator instance
@@ -435,7 +235,6 @@ class PipelineOrchestrator:
         self._vad_end_time: float = 0.0           # set by STT on UTTERANCE (captures latest VAD END)
         self._utterance_time: float = 0.0         # set when UTTERANCE logged
         self._llm_reply_time: float = 0.0         # set when LLM REPLY logged (for Δllm_to_ttfa)
-        self._llm_start_time: float = 0.0         # set on first LLM chunk; guards _flush_buffer before first chunk
 
     # ── Public entrypoint ─────────────────────────────────────────────────────
 
@@ -476,7 +275,7 @@ class PipelineOrchestrator:
             _log(f"[{_ts()}] STT         pipeline ready")
 
             # 5. Chat context — system prompt seeded once per call
-            self._chat_ctx = _ChatContext()
+            self._chat_ctx = agents_llm.ChatContext()
             self._chat_ctx.add_message(role="system", content=self.system_prompt)
 
             # 6. ToolRegistry — per-call so persona_id is scoped correctly
@@ -568,28 +367,23 @@ class PipelineOrchestrator:
             tts_pipeline.get_pipeline()       → self._tts
             llm.chat(...)                     → self._llm.chat(...)
             execute_tool(...)                 → execute_tool(...) (unchanged)
-            chat_ctx.insert(FunctionCall...)  → chat_ctx.add_tool_call() / add_tool_result()
+            chat_ctx.insert(FunctionCall...)  → unchanged (LiveKit API)
 
         Tuning knobs, _should_flush, _flush_buffer, tool loop, CancelledError
         handler — all identical to main.py.
         """
         # ── Tuning knobs ──────────────────────────────────────────────────
-        FIRST_CHUNK_MIN       = 20     # min chars before first mid-stream flush
-        FIRST_CHUNK_MAX_WAIT_MS = 400  # Problem 2: force-flush after this ms from first LLM token
-        CLAUSE_MIN_CHARS      =  8
-        HARD_CAP_CHARS        = 120
-        SENTENCE_MARKERS      = (". ", "? ", "! ", ".\n", "?\n", "!\n")
-        CLAUSE_MARKERS        = (", ", "; ", ": ", " - ", "\n")
-        MAX_TOOL_ROUNDS       =  5
+        FIRST_CHUNK_MIN  = 20
+        CLAUSE_MIN_CHARS =  8
+        HARD_CAP_CHARS   = 120
+        SENTENCE_MARKERS = (". ", "? ", "! ", ".\n", "?\n", "!\n")
+        CLAUSE_MARKERS   = (", ", "; ", ": ", " - ", "\n")
+        MAX_TOOL_ROUNDS  =  5
         # ──────────────────────────────────────────────────────────────────
 
         def _should_flush(buf: str, first_sent: bool) -> bool:
             size      = len(buf)
             min_chars = FIRST_CHUNK_MIN if not first_sent else CLAUSE_MIN_CHARS
-            # Problem 2: relax FIRST_CHUNK_MIN for the very first flush — if the buffer
-            # already ends with a sentence marker, send it regardless of char count.
-            if not first_sent and buf.endswith(SENTENCE_MARKERS):
-                return True
             if size >= HARD_CAP_CHARS:
                 return buf[-1] == " " or buf.endswith(CLAUSE_MARKERS) or buf.endswith(SENTENCE_MARKERS)
             if buf.endswith(SENTENCE_MARKERS):
@@ -598,23 +392,10 @@ class PipelineOrchestrator:
                 return size >= min_chars
             return False
 
-        # Matches complete XML tags <...> OR an unclosed tag fragment at end of string.
-        # The second alternative (<[^>]*$) is what catches a lone '<' or a partially-streamed
-        # '<emotion name="...' when the 400ms flush fires before the tag is fully received.
-        _XML_TAG_RE = re.compile(r"<[^>]*>|<[^>]*$")
-
-        def _visible_text(buf: str) -> str:
-            """Strip XML/SSML tags and surrounding whitespace — what Cartesia will actually speak."""
-            return _XML_TAG_RE.sub("", buf).strip().lstrip(", ;:-")
-
         def _flush_buffer(buf: str) -> str:
             """Sends buf to TTS if not interrupted; always returns '' to reset caller."""
             text = buf.strip().lstrip(", ;:-")
-            visible = _visible_text(buf)
-            # Don't call speak() if the buffer is pure XML markup with no speakable content.
-            # This prevents Cartesia's 'no audio frames pushed' error when the time-based
-            # flush fires mid-tag (e.g. buffer == '<' or '<emotion name="...').
-            if text and visible and not self._tts._interrupted:
+            if text and not self._tts._interrupted:
                 _log(f"[{_ts()}] LLM STREAM  → {text!r}")
                 asyncio.ensure_future(self._tts.speak(text, vad_start_time=self._vad_start_time, llm_start_time=self._llm_start_time))
             return ""
@@ -634,16 +415,14 @@ class PipelineOrchestrator:
                 stream = self._llm.chat(chat_ctx, TOOLS)
                 async with stream:
                     first_chunk = True
-                    first_chunk_time      = time.perf_counter()
-                    first_chunk_time_mono = 0.0   # Problem 2: monotonic ref for time-based flush
+                    first_chunk_time = time.perf_counter()
                     async for chunk in stream:
                         if first_chunk:
                             latency = time.perf_counter() - first_chunk_time
                             # Record start time for llm_to_ttfa tracking (use monotonic)
-                            self._llm_start_time  = time.monotonic()
-                            first_chunk_time_mono = self._llm_start_time
+                            self._llm_start_time = time.monotonic()
                             utt_to_llm_delta = _compute_delta_ms(f"utt_to_llm_{turn_idx}")
-                            _log(f"[{_ts()}] LLM STREAM  first chunk received after {latency:.2f}s{_delta_str('utt_to_llm', utt_to_llm_delta)}")
+                            _log(f"[{_ts()}] LLM STREAM  first chunk received after {latency:.2f}s")
                             first_chunk = False
                         # _log(f"[{_ts()}] LLM STREAM  chunk received → content={chunk.delta.content if chunk.delta and chunk.delta.content else ''}")
                         # Tool-call delta — merge fragments by call_id
@@ -658,7 +437,7 @@ class PipelineOrchestrator:
                                 else:
                                     if tc.name:
                                         tool_calls_map[tc.call_id]["name"] = tc.name
-                            tool_calls_map[tc.call_id]["arguments_str"] += tc.arguments or ""
+                                tool_calls_map[tc.call_id]["arguments_str"] += tc.arguments or ""
                             continue
 
                         # Text delta — stream to TTS
@@ -667,18 +446,6 @@ class PipelineOrchestrator:
                         full_response   += token
 
                         if _should_flush(sentence_buffer, first_chunk_sent):
-                            sentence_buffer  = _flush_buffer(sentence_buffer)
-                            first_chunk_sent = True
-                        # Problem 2 — time-based flush fallback: force TTS to start within
-                        # FIRST_CHUNK_MAX_WAIT_MS of the first LLM token even without a
-                        # sentence marker (covers short responses that now exceed threshold).
-                        elif (
-                            not first_chunk_sent
-                            and first_chunk_time_mono > 0
-                            and (time.monotonic() - first_chunk_time_mono) * 1000 > FIRST_CHUNK_MAX_WAIT_MS
-                            and _visible_text(sentence_buffer)
-                        ):
-                            _log(f"[{_ts()}] LLM STREAM  time-based flush after {FIRST_CHUNK_MAX_WAIT_MS}ms")
                             sentence_buffer  = _flush_buffer(sentence_buffer)
                             first_chunk_sent = True
 
@@ -721,16 +488,18 @@ class PipelineOrchestrator:
                         "data": {"args": args, "result": result},
                     })
 
-                    # Append tool call and result to chat context in wire format
-                    chat_ctx.add_tool_call(
+                    # LiveKit ChatContext tool result API — unchanged from main.py
+                    chat_ctx.insert(FunctionCall(
                         call_id=tc["id"],
                         name=tool_name,
                         arguments=tc["arguments_str"] or "{}",
-                    )
-                    chat_ctx.add_tool_result(
+                    ))
+                    chat_ctx.insert(FunctionCallOutput(
                         call_id=tc["id"],
-                        content=result,
-                    )
+                        name=tool_name,
+                        output=result,
+                        is_error=False,
+                    ))
 
                 # Loop — LLM generates reply using tool results
 

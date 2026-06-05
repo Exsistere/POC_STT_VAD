@@ -49,8 +49,17 @@ logging.getLogger("asyncio").setLevel(logging.WARNING)
 
 # ─── Shared constants ─────────────────────────────────────────────────────────
 
-# After VAD silence, wait this long for the final Deepgram transcript
-FINAL_WAIT = 1.5
+# After VAD silence, wait this long for the final Deepgram transcript.
+# Two-tier strategy:
+#   INTERIM_WAIT  — used when a substantial interim (≥ INTERIM_FLUSH_MIN_CHARS) already
+#                   exists at VAD end. Short enough to catch settled interims; if a final
+#                   arrives inside this window the existing cancellation logic uses it.
+#   FINAL_WAIT    — fallback for short/empty interims where we really need the final
+#                   (single-word utterances: "hello", "yes", "okay").
+INTERIM_WAIT            = 0.25   # seconds — used when interim is substantial
+FINAL_WAIT              = 0.45   # seconds — fallback for short/no interim
+INTERIM_FLUSH_MIN_CHARS = 8      # chars in last interim to qualify for the shorter wait
+RETRY_WAIT              = 0.20   # seconds — re-schedule when timer fires with no text yet
 
 BLUE  = "\033[34m"
 GREEN = "\033[32m"
@@ -158,7 +167,20 @@ class _UtteranceStateMachine:
     def on_speech_end(self) -> None:
         self._speech_active = False
         self._vad_ended     = True
-        self._flush_task    = asyncio.ensure_future(self._wait_and_flush())
+        # Dual-condition EOU gate: if a Deepgram final has already arrived before
+        # VAD silence, skip the timer entirely and flush immediately.
+        if self._utterance_parts:
+            self._do_flush()
+        else:
+            # Two-tier wait: use the shorter INTERIM_WAIT when we already have a
+            # substantial interim — catches the settled interim that typically arrives
+            # 150–300ms after VAD end, saving ~200ms vs the full FINAL_WAIT fallback.
+            wait = (
+                INTERIM_WAIT
+                if len(self._last_interim.strip()) >= INTERIM_FLUSH_MIN_CHARS
+                else FINAL_WAIT
+            )
+            self._flush_task = asyncio.ensure_future(self._wait_and_flush(wait))
 
     def on_interim(self, text: str, lang: str = "?") -> None:
         self._last_interim = text
@@ -185,12 +207,18 @@ class _UtteranceStateMachine:
 
         full = " ".join(self._utterance_parts).strip() or self._last_interim.strip()
         if full:
-            e2e_ms = (self._first_final_time - self._speech_start_time) * 1000
+            # Problem 5 — E2E clock guard: _first_final_time is 0.0 on the fallback
+            # path (no final received). Guard against the resulting large negative value.
+            if self._first_final_time > 0:
+                e2e_ms  = (self._first_final_time - self._speech_start_time) * 1000
+                e2e_str = f"{e2e_ms:.0f}ms (speech start → first final)"
+            else:
+                e2e_str = "n/a (no final transcript received)"
             vad_to_utt_delta = _compute_delta_ms("vad_to_utt", self._speech_index)
             log_transcript(
                 f"│  [{_ts()}] EOU        VAD\n"
                 f"│  [{_ts()}] UTTERANCE  {full}{vad_to_utt_delta}\n"
-                f"│  [{_ts()}] E2E        {e2e_ms:.0f}ms (speech start → first final)\n"
+                f"│  [{_ts()}] E2E        {e2e_str}\n"
                 f"└─── SPEECH #{self._speech_index} END   [{_ts()}] {'─' * 30}"
             )
             self._queue.put_nowait(full)
@@ -198,8 +226,15 @@ class _UtteranceStateMachine:
         self._utterance_parts.clear()
         self._last_interim = ""
 
-    async def _wait_and_flush(self) -> None:
-        await asyncio.sleep(FINAL_WAIT)
+    async def _wait_and_flush(self, wait: float = FINAL_WAIT) -> None:
+        await asyncio.sleep(wait)
+        # If neither a final nor an interim has arrived yet, the timer fired too early
+        # (e.g. first Deepgram interim arrives 100ms after FINAL_WAIT on a single-word
+        # utterance like "hello"). Reschedule a short retry rather than returning silently
+        # and waiting up to 5s for the Deepgram final.
+        if not self._utterance_parts and not self._last_interim and not self._flushed:
+            self._flush_task = asyncio.ensure_future(self._wait_and_flush(RETRY_WAIT))
+            return
         self._do_flush()
 
 
@@ -273,20 +308,32 @@ class _LiveKitSource(_InputSource):
             _flushed = True
             full = " ".join(_utterance_parts).strip() or _last_interim.strip()
             if full:
-                e2e_ms = (_first_final_time - _speech_start_time) * 1000
+                # Problem 5 — E2E clock guard: _first_final_time is 0.0 on the
+                # fallback path (no final received). Avoid large negative values.
+                if _first_final_time > 0:
+                    e2e_ms  = (_first_final_time - _speech_start_time) * 1000
+                    e2e_str = f"{e2e_ms:.0f}ms (speech start → first final)"
+                else:
+                    e2e_str = "n/a (no final transcript received)"
                 vad_to_utt_delta = _compute_delta_ms("vad_to_utt", _speech_index)
                 log_transcript(
                     f"│  [{_ts()}] EOU        VAD\n"
                     f"│  [{_ts()}] UTTERANCE  {full}{vad_to_utt_delta}\n"
-                    f"│  [{_ts()}] E2E        {e2e_ms:.0f}ms (speech start → first final)\n"
+                    f"│  [{_ts()}] E2E        {e2e_str}\n"
                     f"└─── SPEECH #{_speech_index} END   [{_ts()}] {'─' * 30}"
                 )
                 utterance_queue.put_nowait(full)
             _utterance_parts.clear()
             _last_interim = ""
 
-        async def _wait_for_final_then_flush():
-            await asyncio.sleep(FINAL_WAIT)
+        async def _wait_for_final_then_flush(wait: float = FINAL_WAIT):
+            nonlocal _flush_task
+            await asyncio.sleep(wait)
+            # If neither a final nor an interim has arrived yet, reschedule a short
+            # retry so a late-arriving interim (e.g. +553ms on "hello") is not missed.
+            if not _utterance_parts and not _last_interim and not _flushed:
+                _flush_task = asyncio.ensure_future(_wait_for_final_then_flush(RETRY_WAIT))
+                return
             _do_flush()
 
         @session.on("user_state_changed")
@@ -320,7 +367,18 @@ class _LiveKitSource(_InputSource):
             elif event.new_state != "speaking" and _speech_active:
                 _speech_active = False
                 _vad_ended     = True
-                _flush_task    = asyncio.ensure_future(_wait_for_final_then_flush())
+                # Dual-condition EOU gate: if a Deepgram final already landed,
+                # flush immediately — skip the FINAL_WAIT timer entirely.
+                if _utterance_parts:
+                    _do_flush()
+                else:
+                    # Two-tier wait: shorter window when a good interim already exists.
+                    wait = (
+                        INTERIM_WAIT
+                        if len(_last_interim.strip()) >= INTERIM_FLUSH_MIN_CHARS
+                        else FINAL_WAIT
+                    )
+                    _flush_task = asyncio.ensure_future(_wait_for_final_then_flush(wait))
 
         @session.on("user_input_transcribed")
         def on_transcript(event: UserInputTranscribedEvent):
@@ -439,20 +497,32 @@ class _WebRTCSource(_InputSource):
             _flushed = True
             full = " ".join(_utterance_parts).strip() or _last_interim.strip()
             if full:
-                e2e_ms = (_first_final_time - _speech_start_time) * 1000
+                # Problem 5 — E2E clock guard: _first_final_time is 0.0 on the
+                # fallback path (no final received). Avoid large negative values.
+                if _first_final_time > 0:
+                    e2e_ms  = (_first_final_time - _speech_start_time) * 1000
+                    e2e_str = f"{e2e_ms:.0f}ms (speech start → first final)"
+                else:
+                    e2e_str = "n/a (no final transcript received)"
                 vad_to_utt_delta = _compute_delta_ms("vad_to_utt", _speech_index)
                 log_transcript(
                     f"│  [{_ts()}] EOU        VAD\n"
                     f"│  [{_ts()}] UTTERANCE  {full}{vad_to_utt_delta}\n"
-                    f"│  [{_ts()}] E2E        {e2e_ms:.0f}ms (speech start → first final)\n"
+                    f"│  [{_ts()}] E2E        {e2e_str}\n"
                     f"└─── SPEECH #{_speech_index} END   [{_ts()}] {'─' * 30}"
                 )
                 utterance_queue.put_nowait(full)
             _utterance_parts.clear()
             _last_interim = ""
 
-        async def _wait_for_final_then_flush():
-            await asyncio.sleep(FINAL_WAIT)
+        async def _wait_for_final_then_flush(wait: float = FINAL_WAIT):
+            nonlocal _flush_task
+            await asyncio.sleep(wait)
+            # If neither a final nor an interim has arrived yet, reschedule a short
+            # retry so a late-arriving interim (e.g. +553ms on "hello") is not missed.
+            if not _utterance_parts and not _last_interim and not _flushed:
+                _flush_task = asyncio.ensure_future(_wait_for_final_then_flush(RETRY_WAIT))
+                return
             _do_flush()
 
         # ── VAD callbacks ──────────────────────────────────────────────────
@@ -462,15 +532,30 @@ class _WebRTCSource(_InputSource):
             nonlocal _speech_start_time, _flushed, _vad_ended, _flush_task, _first_final_time
 
             log_transcript(f"│  [{_ts()}] USER STATE  speaking ← VAD START")
-            if interrupt_fn is not None:
-                try:
-                    interrupt_fn()
-                except Exception:
-                    pass
+
+            # Problem 4 — Deferred barge-in gate: only cancel TTS if speech is still
+            # active 250ms later. This prevents transients (<250ms) — coughs, clicks,
+            # breath sounds — from killing TTS mid-sentence.
+            # Capture the index this segment *will* receive after the increment below.
+            # If a second VAD start fires within the 250ms window, _speech_index will
+            # have changed and _maybe_interrupt will correctly suppress the stale callback.
+            _scheduled_for_index = _speech_index + 1
+
+            def _maybe_interrupt():
+                # Only interrupt if we are still on the same speech segment that
+                # scheduled this callback — guards against a transient immediately
+                # followed by a real utterance (second start increments _speech_index).
+                if _speech_active and _speech_index == _scheduled_for_index:
+                    if interrupt_fn is not None:
+                        try:
+                            interrupt_fn()
+                        except Exception:
+                            pass
+            asyncio.get_event_loop().call_later(0.25, _maybe_interrupt)
 
             if _flush_task and not _flush_task.done():
                 _flush_task.cancel()
-            _do_flush()
+            _do_flush()   # flush any previous utterance immediately
 
             _speech_active     = True
             _speech_index     += 1
@@ -494,7 +579,18 @@ class _WebRTCSource(_InputSource):
                 return
             _speech_active = False
             _vad_ended     = True
-            _flush_task    = asyncio.ensure_future(_wait_for_final_then_flush())
+            # Dual-condition EOU gate: if a Deepgram final already landed,
+            # flush immediately — skip the FINAL_WAIT timer entirely.
+            if _utterance_parts:
+                _do_flush()
+            else:
+                # Two-tier wait: shorter window when a good interim already exists.
+                wait = (
+                    INTERIM_WAIT
+                    if len(_last_interim.strip()) >= INTERIM_FLUSH_MIN_CHARS
+                    else FINAL_WAIT
+                )
+                _flush_task = asyncio.ensure_future(_wait_for_final_then_flush(wait))
 
         # ── Deepgram transcript handler (raw JSON from websocket) ──────────
         # Mirrors GeminiDeepgramVoiceAgent._listen_to_deepgram_and_trigger
