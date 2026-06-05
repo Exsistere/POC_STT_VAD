@@ -363,14 +363,32 @@ class TTSPipeline:
 
     # ── Construction ──────────────────────────────────────────────────────────
 
-    def __init__(self, sink: _OutputSink, http_session: "aiohttp.ClientSession | None" = None) -> None:
+    def __init__(
+        self,
+        sink: _OutputSink,
+        http_session: "aiohttp.ClientSession | None" = None,
+        voice: Optional[str] = None,
+        language: str = "en"
+    ) -> None:
         self._sink = sink
+        
+        # Validate Cartesia voice format (usually a UUID). Fallback to TTS_VOICE if invalid.
+        active_voice = TTS_VOICE
+        if voice:
+            import uuid
+            try:
+                uuid.UUID(str(voice))
+                active_voice = voice
+            except (ValueError, TypeError):
+                pass
+
         # In FastAPI/WebRTC mode, pass the shared aiohttp session so Cartesia
         # doesn't try to use LiveKit's http_context (only exists inside a job worker).
         # In CLI/LiveKit mode, http_session=None and Cartesia manages its own session.
         tts_kwargs: dict = dict(
             model=TTS_MODEL,
-            voice=TTS_VOICE,
+            voice=active_voice,
+            language=language,
             api_key=os.getenv("CARTESIA_API_KEY"),
         )
         if http_session is not None:
@@ -395,10 +413,10 @@ class TTSPipeline:
 
 
     @classmethod
-    def for_webrtc(cls, agent_audio_track) -> "TTSPipeline":
+    def for_webrtc(cls, agent_audio_track, voice: Optional[str] = None, language: str = "en") -> "TTSPipeline":
         """WebRTC / PipelineOrchestrator mode. Uses module-level aiohttp session."""
         session = _http_session or aiohttp.ClientSession()
-        return cls(_WebRTCSink(agent_audio_track), http_session=session)
+        return cls(_WebRTCSink(agent_audio_track), http_session=session, voice=voice, language=language)
 
     # ── Public API ────────────────────────────────────────────────────────────
 

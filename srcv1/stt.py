@@ -396,9 +396,10 @@ class _WebRTCSource(_InputSource):
     )
     KEEPALIVE_INTERVAL = 5   # seconds between KeepAlive pings
 
-    def __init__(self, mic_track, vad) -> None:
+    def __init__(self, mic_track, vad, language: str = "en") -> None:
         self._mic_track = mic_track
         self._vad       = vad
+        self._language  = language
 
     async def run(
         self,
@@ -657,10 +658,28 @@ class _WebRTCSource(_InputSource):
 
         # ── Connect and run all tasks concurrently ─────────────────────────
 
-        log_transcript(f"[{_ts()}] WEBRTC      opening Deepgram WebSocket connection")
+        dg_lang = "en-US"
+        if self._language == "gu":
+            dg_lang = "gu"
+        elif self._language == "hi":
+            dg_lang = "hi"
+
+        deepgram_url = (
+            "wss://api.deepgram.com/v1/listen"
+            "?model=nova-3"
+            "&encoding=linear16"
+            "&sample_rate=16000"
+            "&channels=1"
+            f"&language={dg_lang}"
+            "&interim_results=true"
+            "&endpointing=250"
+            "&utterance_end_ms=1000"
+        )
+
+        log_transcript(f"[{_ts()}] WEBRTC      opening Deepgram WebSocket connection language={dg_lang}")
         try:
             async with websockets.connect(
-                self.DEEPGRAM_URL,
+                deepgram_url,
                 additional_headers=deepgram_headers,
             ) as dg_ws:
                 log_transcript(f"[{_ts()}] WEBRTC      ✓ Deepgram connection open")
@@ -721,9 +740,9 @@ class STTPipeline:
         return cls(_LiveKitSource(ctx), interrupt_fn)
 
     @classmethod
-    def for_webrtc(cls, track, vad, interrupt_fn=None) -> "STTPipeline":
+    def for_webrtc(cls, track, vad, interrupt_fn=None, language: str = "en") -> "STTPipeline":
         """WebRTC / PipelineOrchestrator mode."""
-        return cls(_WebRTCSource(track, vad), interrupt_fn)
+        return cls(_WebRTCSource(track, vad, language), interrupt_fn)
 
     async def stream(self) -> AsyncGenerator[str, None]:
         """
@@ -795,14 +814,14 @@ def init_pipeline(ctx, interrupt_fn=None) -> None:
     _pipeline = STTPipeline.for_livekit(ctx, interrupt_fn)
 
 
-def init_pipeline_webrtc(track, vad, interrupt_fn=None) -> STTPipeline:
+def init_pipeline_webrtc(track, vad, interrupt_fn=None, language: str = "en") -> STTPipeline:
     """
     WebRTC mode initialiser.
     Called from PipelineOrchestrator — one instance per call.
     Does NOT set module-level _pipeline so CLI and WebRTC don't stomp each other.
     Returns the instance directly for the orchestrator to hold.
     """
-    return STTPipeline.for_webrtc(track, vad, interrupt_fn)
+    return STTPipeline.for_webrtc(track, vad, interrupt_fn, language)
 
 
 async def stt_stream(ctx=None) -> AsyncGenerator[str, None]:

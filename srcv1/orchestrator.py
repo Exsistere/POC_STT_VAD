@@ -209,6 +209,7 @@ class PipelineOrchestrator:
         persona_id: str,
         db_connection,
         language_code: str = "en",   # kept for API compatibility with VoiceAgentManager
+        voice_id: Optional[str] = None,
     ) -> None:
         global _llm_client_instance
         self.system_prompt    = system_prompt
@@ -216,6 +217,7 @@ class PipelineOrchestrator:
         self.persona_id       = persona_id
         self.db_pool          = db_connection
         self.language_code    = language_code
+        self.voice_id         = voice_id
 
         # Call record — mirrors VoiceAgentManager
         self.call_transcript: list[dict] = []
@@ -260,9 +262,13 @@ class PipelineOrchestrator:
             vad = await get_vad()
 
             # 2. TTS pipeline
-            self._tts = TTSPipeline.for_webrtc(self.agent_audio_track)
+            self._tts = TTSPipeline.for_webrtc(
+                self.agent_audio_track,
+                voice=self.voice_id,
+                language=self.language_code
+            )
             await self._tts.start()
-            _log(f"[{_ts()}] TTS         pipeline ready")
+            _log(f"[{_ts()}] TTS         pipeline ready (voice={self.voice_id}, lang={self.language_code})")
 
             # 3. Wire LLM cancel → TTS barge-in so VAD speech start cancels generation
             def _cancel_llm():
@@ -277,8 +283,9 @@ class PipelineOrchestrator:
                 track=user_audio_track,
                 vad=vad,
                 interrupt_fn=self._tts.interrupt,
+                language=self.language_code,
             )
-            _log(f"[{_ts()}] STT         pipeline ready")
+            _log(f"[{_ts()}] STT         pipeline ready (lang={self.language_code})")
 
             # 5. Chat context — system prompt seeded once per call
             self._chat_ctx = agents_llm.ChatContext()

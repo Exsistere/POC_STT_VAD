@@ -98,8 +98,32 @@ async def offer(
         f"Incoming call. Fetching DB config for Persona ID: {request.persona_id}"
     )
 
+    import uuid
+    try:
+        persona_uuid = uuid.UUID(request.persona_id)
+    except ValueError:
+        persona_uuid = request.persona_id
+
+    # Fetch persona to get voice_id and name
+    persona = await db.fetchrow("SELECT * FROM personas WHERE id = $1", persona_uuid)
+    if not persona:
+        raise HTTPException(status_code=404, detail="Persona not found")
+
+    voice_id = persona["voice_id"]
+    persona_name = persona["name"] or ""
+
     # Inject the dynamic prompt generated from PostgreSQL
     system_prompt = await fetch_dynamic_prompt(request.persona_id, db)
+
+    # Determine language from persona name or system prompt
+    prompt_lower = system_prompt.lower()
+    name_lower = persona_name.lower()
+    if "gujarati" in name_lower or "gujrati" in name_lower or "gujarati" in prompt_lower or "gujrati" in prompt_lower:
+        language_code = "gu"
+    elif "hindi" in name_lower or "hindi" in prompt_lower:
+        language_code = "hi"
+    else:
+        language_code = "en"
 
     offer = RTCSessionDescription(sdp=request.sdp, type=request.type)
     pc = RTCPeerConnection()
@@ -137,6 +161,8 @@ async def offer(
                 agent_audio_track=agent_audio,
                 db_connection=get_db_pool(),
                 persona_id=request.persona_id,
+                language_code=language_code,
+                voice_id=voice_id,
             )
             asyncio.create_task(agent_manager.start(track))
     await pc.setRemoteDescription(offer)
