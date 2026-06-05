@@ -391,7 +391,7 @@ class _WebRTCSource(_InputSource):
         "&channels=1"
         "&language=en-US"
         "&interim_results=true"
-        "&endpointing=300"
+        "&endpointing=200"
         "&utterance_end_ms=1000"
     )
     KEEPALIVE_INTERVAL = 5   # seconds between KeepAlive pings

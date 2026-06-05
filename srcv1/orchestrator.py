@@ -191,6 +191,9 @@ class _LLMClient:
             return self._llm.chat(chat_ctx=chat_ctx, tools=tools)
         return self._llm.chat(chat_ctx=chat_ctx)
 
+# Global LLM client singleton to reuse HTTP/2 connection pools across multiple calls
+_llm_client_instance: Optional[_LLMClient] = None
+
 # ─── PipelineOrchestrator ─────────────────────────────────────────────────────
 
 class PipelineOrchestrator:
@@ -206,6 +209,7 @@ class PipelineOrchestrator:
         db_connection,
         language_code: str = "en",   # kept for API compatibility with VoiceAgentManager
     ) -> None:
+        global _llm_client_instance
         self.system_prompt    = system_prompt
         self.agent_audio_track = agent_audio_track
         self.persona_id       = persona_id
@@ -219,7 +223,9 @@ class PipelineOrchestrator:
         # Internals — created in start()
         self._tts: Optional[TTSPipeline]  = None
         self._stt: Optional[STTPipeline]  = None
-        self._llm = _LLMClient()
+        if _llm_client_instance is None:
+            _llm_client_instance = _LLMClient()
+        self._llm = _llm_client_instance
         self._chat_ctx: Optional[agents_llm.ChatContext] = None
         self._current_llm_task: Optional[asyncio.Task] = None
         

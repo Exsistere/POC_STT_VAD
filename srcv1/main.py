@@ -16,6 +16,7 @@ from orchestrator import PipelineOrchestrator
 from agent_audio_track import AgentAudioTrack
 from routers import personas
 from database import init_db_pool, close_db_pool, get_db_connection, get_db_pool
+from tts import create_http_session, close_http_session
 
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger("webrtc-agent")
@@ -25,9 +26,11 @@ pcs = set()
 async def lifespan(app: FastAPI):
     logger.info("Voice AI server is starting up...")
     await init_db_pool()  # Connect to Postgres!
+    await create_http_session()  # Initialize global HTTP session for Cartesia
     yield
     logger.info("Server shutting down. Cleaning up connections...")
     await close_db_pool()  # Disconnect from Postgres cleanly
+    await close_http_session()  # Close global HTTP session cleanly
     coros = [pc.close() for pc in pcs]
     if coros:
         await asyncio.gather(*coros)
