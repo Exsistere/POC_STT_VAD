@@ -39,10 +39,12 @@ from typing import Optional
 import time
 from dotenv import load_dotenv
 from livekit.agents import llm as agents_llm
+from livekit.agents.llm import FunctionCall, FunctionCallOutput
 from livekit.plugins import groq, openai, google, cerebras
 
 from tts import TTSPipeline
 from stt import STTPipeline
+from tools import execute_tool, TOOLS
 
 load_dotenv(override=True)
 
@@ -289,7 +291,10 @@ class PipelineOrchestrator:
             self._chat_ctx = agents_llm.ChatContext()
             self._chat_ctx.add_message(role="system", content=self.system_prompt)
 
-
+            # 6. ToolRegistry — per-call so persona_id is scoped correctly
+            from tools import ToolRegistry
+            ToolRegistry.init(db_connection=self.db_pool, persona_id=self.persona_id)
+            _log(f"[{_ts()}] TOOLS       ToolRegistry initialized for persona={self.persona_id}")
 
             # 7. Start dynamic greeting in the background
             _log(f"[{_ts()}] ORCHESTRATOR starting dynamic greeting...")
@@ -419,55 +424,122 @@ class PipelineOrchestrator:
         full_response = ""   # kept in scope for CancelledError handler
 
         try:
-            self._round_index = 1
-            _log(f"[{_ts()}] LLM STREAM  starting round {self._round_index}")
-            sentence_buffer  = ""
-            first_chunk_sent = False
+            for _round in range(MAX_TOOL_ROUNDS):
+                self._round_index = _round + 1
+                _log(f"[{_ts()}] LLM STREAM  starting round {self._round_index}")
+                sentence_buffer  = ""
+                full_response    = ""
+                first_chunk_sent = False
+                tool_calls_map: dict[str, dict] = {}
 
-            # ── Stream one LLM turn ───────────────────────────────────
-            stream = self._llm.chat(chat_ctx)
-            async with stream:
-                first_chunk = True
-                first_chunk_time = time.perf_counter()
-                in_tag = False
-                async for chunk in stream:
-                    if first_chunk:
-                        latency = time.perf_counter() - first_chunk_time
-                        # Record start time for llm_to_ttfa tracking (use monotonic)
-                        self._llm_start_time = time.monotonic()
-                        utt_to_llm_delta = _compute_delta_ms(f"utt_to_llm_{turn_idx}")
-                        _log(f"[{_ts()}] LLM STREAM  first chunk received after {latency:.2f}s")
-                        first_chunk = False
+                # ── Stream one LLM turn ───────────────────────────────────
+                stream = self._llm.chat(chat_ctx)
+                async with stream:
+                    first_chunk = True
+                    first_chunk_time = time.perf_counter()
+                    in_tag = False
+                    async for chunk in stream:
+                        if first_chunk:
+                            latency = time.perf_counter() - first_chunk_time
+                            # Record start time for llm_to_ttfa tracking (use monotonic)
+                            self._llm_start_time = time.monotonic()
+                            utt_to_llm_delta = _compute_delta_ms(f"utt_to_llm_{turn_idx}")
+                            _log(f"[{_ts()}] LLM STREAM  first chunk received after {latency:.2f}s")
+                            first_chunk = False
+                        # _log(f"[{_ts()}] LLM STREAM  chunk received → content={chunk.delta.content if chunk.delta and chunk.delta.content else ''}")
+                        # Tool-call delta — merge fragments by call_id
+                        if chunk.delta and chunk.delta.tool_calls:
+                            for tc in chunk.delta.tool_calls:
+                                if tc.call_id not in tool_calls_map:
+                                    tool_calls_map[tc.call_id] = {
+                                        "id":            tc.call_id,
+                                        "name":          tc.name or "",
+                                        "arguments_str": "",
+                                    }
+                                else:
+                                    if tc.name:
+                                        tool_calls_map[tc.call_id]["name"] = tc.name
+                                tool_calls_map[tc.call_id]["arguments_str"] += tc.arguments or ""
+                            continue
 
-                    # Text delta — stream to TTS
-                    token           = (chunk.delta and chunk.delta.content) or ""
-                    full_response   += token
+                        # Text delta — stream to TTS
+                        token           = (chunk.delta and chunk.delta.content) or ""
+                        full_response   += token
 
-                    clean_token = ""
-                    for char in token:
-                        if char == '<':
-                            in_tag = True
-                        elif char == '>':
-                            in_tag = False
-                        elif not in_tag:
-                            clean_token += char
+                        clean_token = ""
+                        for char in token:
+                            if char == '<':
+                                in_tag = True
+                            elif char == '>':
+                                in_tag = False
+                            elif not in_tag:
+                                clean_token += char
 
-                    sentence_buffer += clean_token
+                        sentence_buffer += clean_token
 
-                    if _should_flush(sentence_buffer, first_chunk_sent):
-                        sentence_buffer  = _flush_buffer(sentence_buffer)
-                        first_chunk_sent = True
+                        if _should_flush(sentence_buffer, first_chunk_sent):
+                            sentence_buffer  = _flush_buffer(sentence_buffer)
+                            first_chunk_sent = True
 
-            # ── Plain text response — flush remainder and finish ──────
-            if sentence_buffer.strip():
-                _flush_buffer(sentence_buffer)
-            _log(f"[{_ts()}] LLM REPLY   → {full_response[:80]!r}")
-            chat_ctx.add_message(role="assistant", content=full_response)
-            # Append to transcript
-            self.call_transcript.append(
-                {"speaker": "Agent", "text": full_response}
+                # ── Plain text response — flush remainder and finish ──────
+                if not tool_calls_map:
+                    if sentence_buffer.strip():
+                        _flush_buffer(sentence_buffer)
+                    _log(f"[{_ts()}] LLM REPLY   → {full_response[:80]!r}")
+                    chat_ctx.add_message(role="assistant", content=full_response)
+                    # Append to transcript
+                    self.call_transcript.append(
+                        {"speaker": "Agent", "text": full_response}
+                    )
+                    return
+
+                # ── Tool calls — execute, append results, loop ────────────
+                _log(f"[{_ts()}] TOOL CALLS  {[tc['name'] for tc in tool_calls_map.values()]}")
+
+                if full_response:
+                    chat_ctx.add_message(role="assistant", content=full_response)
+
+                for call_id, tc in tool_calls_map.items():
+                    try:
+                        args = json.loads(tc["arguments_str"] or "{}")
+                    except json.JSONDecodeError:
+                        args = {}
+
+                    self._tool_call_counter += 1
+                    tool_idx = self._tool_call_counter
+                    tool_name = tc["name"]
+                    _record_start(f"tool_{tool_name}_{tool_idx}")
+                    _log(f"[{_ts()}] TOOL EXEC   {tool_name}({args})")
+                    result = await execute_tool(tool_name, args)
+                    tool_delta = _compute_delta_ms(f"tool_{tool_name}_{tool_idx}")
+                    _log(f"[{_ts()}] TOOL RESULT {tool_name} → {result[:80]!r}{tool_delta}")
+
+                    # Record tool event — mirrors VoiceAgentManager.call_tools_used
+                    self.call_tools_used.append({
+                        "type": tool_name,
+                        "data": {"args": args, "result": result},
+                    })
+
+                    # LiveKit ChatContext tool result API — unchanged from main.py
+                    chat_ctx.insert(FunctionCall(
+                        call_id=tc["id"],
+                        name=tool_name,
+                        arguments=tc["arguments_str"] or "{}",
+                    ))
+                    chat_ctx.insert(FunctionCallOutput(
+                        call_id=tc["id"],
+                        name=tool_name,
+                        output=result,
+                        is_error=False,
+                    ))
+
+                # Loop — LLM generates reply using tool results
+
+            # Exhausted MAX_TOOL_ROUNDS
+            _log(f"[{_ts()}] TOOL LOOP   max rounds reached — aborting")
+            asyncio.ensure_future(
+                self._tts.speak("Sorry, I'm having trouble completing that request.", vad_start_time=self._vad_start_time, llm_start_time=self._llm_start_time)
             )
-            return
 
         except asyncio.CancelledError:
             # Save whatever was generated before cancellation
