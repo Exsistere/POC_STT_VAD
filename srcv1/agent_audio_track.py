@@ -49,7 +49,7 @@ class AgentAudioTrack(MediaStreamTrack):
         super().__init__()
         self._queue    = asyncio.Queue()
         self._buffer   = bytearray()
-        self._speaking = False   # True between mark_utterance_start and mark_utterance_done
+        self._speaking = True   # True between mark_utterance_start and mark_utterance_done
 
         self._sample_rate = SAMPLE_RATE
         self._time_base   = fractions.Fraction(1, SAMPLE_RATE)

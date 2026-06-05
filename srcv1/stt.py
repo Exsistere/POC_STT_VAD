@@ -391,7 +391,7 @@ class _WebRTCSource(_InputSource):
         "&channels=1"
         "&language=en-US"
         "&interim_results=true"
-        "&endpointing=200"
+        "&endpointing=250"
         "&utterance_end_ms=1000"
     )
     KEEPALIVE_INTERVAL = 5   # seconds between KeepAlive pings
@@ -780,7 +780,7 @@ def prewarm(proc) -> None:
         from livekit.plugins import silero
         proc.userdata["vad"] = silero.VAD.load(
             activation_threshold=0.4,
-            min_silence_duration=0.3,
+            min_silence_duration=0.4,
         )
     except Exception as e:
         logger.error(f"Error loading VAD: {e}")
@@ -836,7 +836,7 @@ async def load_vad() -> None:
         from livekit.plugins import silero
         _webrtc_vad = silero.VAD.load(
             activation_threshold=0.4,
-            min_silence_duration=0.3,
+            min_silence_duration=0.4,
         )
         logger.info("Silero VAD loaded for WebRTC mode")
     except Exception as e:

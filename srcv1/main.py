@@ -80,6 +80,12 @@ async def fetch_dynamic_prompt(persona_id: str, db: asyncpg.Connection) -> str:
         for q in questions:
             final_prompt += f"- Question to ask: '{q['question_text']}' (When to ask: {q['trigger_condition']})\n"
 
+    # Enforce concise but complete replies
+    final_prompt += "\n\nCRITICAL CONVERSATIONAL STYLE RULES:\n"
+    final_prompt += "1. Keep your responses extremely short, punchy, and conversational (under 25-30 words, 1-2 sentences maximum).\n"
+    final_prompt += "2. Never explain things at length. Give a quick answer and ask a single short follow-up question.\n"
+    final_prompt += "3. ALWAYS finish your sentence cleanly. Do not stop mid-sentence.\n"
+
     return final_prompt
 
 

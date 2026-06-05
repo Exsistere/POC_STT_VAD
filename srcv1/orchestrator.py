@@ -127,7 +127,7 @@ async def get_vad():
         _log(f"[{_ts()}] VAD         loading Silero (first call)...")
         _vad = silero.VAD.load(
             activation_threshold=0.4,
-            min_silence_duration=0.3,
+            min_silence_duration=0.4,
         )
         _log(f"[{_ts()}] VAD         loaded")
     return _vad
@@ -159,6 +159,7 @@ class _LLMClient:
                 model=os.getenv("CEREBRAS_MODEL", "llama3.1-8b"),
                 api_key=os.getenv("CEREBRAS_API_KEY"),
                 temperature=float(os.getenv("LLM_TEMPERATURE", "0.3")),
+                max_completion_tokens=int(os.getenv("LLM_MAX_TOKENS", "250")),
             )
         elif provider == "azure":
             self._llm = openai.LLM.with_azure(
@@ -288,9 +289,15 @@ class PipelineOrchestrator:
             ToolRegistry.init(db_connection=self.db_pool, persona_id=self.persona_id)
             _log(f"[{_ts()}] TOOLS       ToolRegistry initialized for persona={self.persona_id}")
 
+            # 7. Start dynamic greeting in the background
+            _log(f"[{_ts()}] ORCHESTRATOR starting dynamic greeting...")
+            self._current_llm_task = asyncio.ensure_future(
+                self._generate_and_speak(self._chat_ctx, turn_idx=0)
+            )
+
             _log(f"[{_ts()}] ORCHESTRATOR running — waiting for utterances")
 
-            # 7. Run STT consumer — blocks until call ends
+            # 8. Run STT consumer — blocks until call ends
             await self._stt_consumer()
 
         except asyncio.CancelledError:
