@@ -52,7 +52,7 @@ llm = openai.LLM.with_azure(
     api_version=os.getenv("OPENAI_API_VERSION"),
     model="openai/gpt-oss-120b",
     temperature=0.3,
-    max_completion_tokens=250,
+    max_completion_tokens=50,
 )
 
 def _ts() -> str:

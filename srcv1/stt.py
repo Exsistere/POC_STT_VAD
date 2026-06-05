@@ -50,7 +50,7 @@ logging.getLogger("asyncio").setLevel(logging.WARNING)
 # ─── Shared constants ─────────────────────────────────────────────────────────
 
 # After VAD silence, wait this long for the final Deepgram transcript
-FINAL_WAIT = 1.5
+FINAL_WAIT = 0.05
 
 BLUE  = "\033[34m"
 GREEN = "\033[32m"
@@ -780,7 +780,7 @@ def prewarm(proc) -> None:
         from livekit.plugins import silero
         proc.userdata["vad"] = silero.VAD.load(
             activation_threshold=0.4,
-            min_silence_duration=0.2,
+            min_silence_duration=0.3,
         )
     except Exception as e:
         logger.error(f"Error loading VAD: {e}")
@@ -836,7 +836,7 @@ async def load_vad() -> None:
         from livekit.plugins import silero
         _webrtc_vad = silero.VAD.load(
             activation_threshold=0.4,
-            min_silence_duration=0.2,
+            min_silence_duration=0.3,
         )
         logger.info("Silero VAD loaded for WebRTC mode")
     except Exception as e:

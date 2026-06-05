@@ -51,7 +51,7 @@ RESET  = "\033[0m"
 llm = groq.LLM(
     model = "openai/gpt-oss-120b",
     api_key = os.getenv("GROQ_API_KEY"),
-    max_completion_tokens=250,
+    max_completion_tokens=50,
     temperature=0.3
 )
 

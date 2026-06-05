@@ -127,7 +127,7 @@ async def get_vad():
         _log(f"[{_ts()}] VAD         loading Silero (first call)...")
         _vad = silero.VAD.load(
             activation_threshold=0.4,
-            min_silence_duration=0.08,
+            min_silence_duration=0.3,
         )
         _log(f"[{_ts()}] VAD         loaded")
     return _vad
@@ -153,44 +153,43 @@ class _LLMClient:
     """
 
     def __init__(self) -> None:
-        self._llm = groq.LLM(
-            model=os.getenv("GROQ_MODEL", "openai/gpt-oss-120b"),
-            api_key=os.getenv("GROQ_API_KEY"),
-            max_completion_tokens=int(os.getenv("LLM_MAX_TOKENS", "250")),
-            temperature=float(os.getenv("LLM_TEMPERATURE", "0.3")),
-        )
-        # self._llm = cerebras.LLM(
-        #     model=os.getenv("CEREBRAS_MODEL", "gpt-oss-120b"),
-        #     api_key=os.getenv("CEREBRAS_API_KEY"),
-        #     # max_completion_tokens=int(os.getenv("LLM_MAX_TOKENS", "250")),
-        #     temperature=float(os.getenv("LLM_TEMPERATURE", "0.3")),
-        # )
-        # self._llm = openai.LLM.with_azure(
-        #         azure_deployment=os.getenv("AZURE_DEPLOYMENT_NAME"),
-        #         azure_endpoint=os.getenv("AZURE_OPENAI_ENDPOINT"),
-        #         api_key=os.getenv("AZURE_OPENAI_API_KEY"),
-        #         api_version=os.getenv("OPENAI_API_VERSION"),
-        #         model="openai/gpt-oss-120b",
-        #         temperature=0.3,
-        #         max_completion_tokens=250,
-        #     )
-        # self._llm = google.LLM(
-        #     model = "gemini-3.5-flash",
-        #     api_key = os.getenv("GEMINI_API_KEY"),
-        #     temperature = 0.2,
-        #     max_output_tokens = 250,
-        #     thinking_config={
-        #         "thinking_level": "low",  # disable thinking
-        #     },
-        #     automatic_function_calling_config = {
-        #         "disable": True,  # disable automatic function calling — we handle it ourselves in _generate_and_speak
-        #     }
-        # )
+        provider = os.getenv("LLM_PROVIDER", "groq").lower()
+        if provider == "cerebras":
+            self._llm = cerebras.LLM(
+                model=os.getenv("CEREBRAS_MODEL", "llama3.1-8b"),
+                api_key=os.getenv("CEREBRAS_API_KEY"),
+                temperature=float(os.getenv("LLM_TEMPERATURE", "0.3")),
+            )
+        elif provider == "azure":
+            self._llm = openai.LLM.with_azure(
+                azure_deployment=os.getenv("AZURE_DEPLOYMENT_NAME"),
+                azure_endpoint=os.getenv("AZURE_OPENAI_ENDPOINT"),
+                api_key=os.getenv("AZURE_OPENAI_API_KEY"),
+                api_version=os.getenv("OPENAI_API_VERSION"),
+                model="openai/gpt-oss-120b",
+                temperature=float(os.getenv("LLM_TEMPERATURE", "0.3")),
+                max_completion_tokens=int(os.getenv("LLM_MAX_TOKENS", "250")),
+            )
+        elif provider == "google":
+            self._llm = google.LLM(
+                model=os.getenv("GEMINI_MODEL", "gemini-1.5-flash"),
+                api_key=os.getenv("GEMINI_API_KEY"),
+                temperature=float(os.getenv("LLM_TEMPERATURE", "0.3")),
+                max_output_tokens=int(os.getenv("LLM_MAX_TOKENS", "250")),
+            )
+        else: # default to groq
+            self._llm = groq.LLM(
+                model=os.getenv("GROQ_MODEL", "llama-3.1-8b-instant"),
+                api_key=os.getenv("GROQ_API_KEY"),
+                max_completion_tokens=int(os.getenv("LLM_MAX_TOKENS", "250")),
+                temperature=float(os.getenv("LLM_TEMPERATURE", "0.3")),
+            )
         
-    def chat(self, chat_ctx, tools):
+    def chat(self, chat_ctx, tools=None):
         """Returns an async context manager that yields LLM chunks."""
-        return self._llm.chat(chat_ctx=chat_ctx, tools=tools)
-        # return self._llm.chat(chat_ctx=chat_ctx,)
+        if tools:
+            return self._llm.chat(chat_ctx=chat_ctx, tools=tools)
+        return self._llm.chat(chat_ctx=chat_ctx)
 
 # ─── PipelineOrchestrator ─────────────────────────────────────────────────────
 
@@ -373,10 +372,10 @@ class PipelineOrchestrator:
         handler — all identical to main.py.
         """
         # ── Tuning knobs ──────────────────────────────────────────────────
-        FIRST_CHUNK_MIN  = 20
-        CLAUSE_MIN_CHARS =  8
+        FIRST_CHUNK_MIN  = 1
+        CLAUSE_MIN_CHARS = 1
         HARD_CAP_CHARS   = 120
-        SENTENCE_MARKERS = (". ", "? ", "! ", ".\n", "?\n", "!\n")
+        SENTENCE_MARKERS = (". ", "? ", "! ", "। ", ".\n", "?\n", "!\n", "।\n", "?", "!", "।")
         CLAUSE_MARKERS   = (", ", "; ", ": ", " - ", "\n")
         MAX_TOOL_ROUNDS  =  5
         # ──────────────────────────────────────────────────────────────────
@@ -387,7 +386,7 @@ class PipelineOrchestrator:
             if size >= HARD_CAP_CHARS:
                 return buf[-1] == " " or buf.endswith(CLAUSE_MARKERS) or buf.endswith(SENTENCE_MARKERS)
             if buf.endswith(SENTENCE_MARKERS):
-                return size >= min_chars
+                return True
             if buf.endswith(CLAUSE_MARKERS):
                 return size >= min_chars
             return False
@@ -395,9 +394,11 @@ class PipelineOrchestrator:
         def _flush_buffer(buf: str) -> str:
             """Sends buf to TTS if not interrupted; always returns '' to reset caller."""
             text = buf.strip().lstrip(", ;:-")
-            if text and not self._tts._interrupted:
-                _log(f"[{_ts()}] LLM STREAM  → {text!r}")
-                asyncio.ensure_future(self._tts.speak(text, vad_start_time=self._vad_start_time, llm_start_time=self._llm_start_time))
+            import re
+            clean_text = re.sub(r'<[^>]+>', '', text).strip()
+            if clean_text and not self._tts._interrupted:
+                _log(f"[{_ts()}] LLM STREAM  → {clean_text!r} (raw: {text!r})")
+                asyncio.ensure_future(self._tts.speak(clean_text, vad_start_time=self._vad_start_time, llm_start_time=self._llm_start_time))
             return ""
 
         full_response = ""   # kept in scope for CancelledError handler
@@ -412,10 +413,11 @@ class PipelineOrchestrator:
                 tool_calls_map: dict[str, dict] = {}
 
                 # ── Stream one LLM turn ───────────────────────────────────
-                stream = self._llm.chat(chat_ctx, TOOLS)
+                stream = self._llm.chat(chat_ctx)
                 async with stream:
                     first_chunk = True
                     first_chunk_time = time.perf_counter()
+                    in_tag = False
                     async for chunk in stream:
                         if first_chunk:
                             latency = time.perf_counter() - first_chunk_time
@@ -442,8 +444,18 @@ class PipelineOrchestrator:
 
                         # Text delta — stream to TTS
                         token           = (chunk.delta and chunk.delta.content) or ""
-                        sentence_buffer += token
                         full_response   += token
+
+                        clean_token = ""
+                        for char in token:
+                            if char == '<':
+                                in_tag = True
+                            elif char == '>':
+                                in_tag = False
+                            elif not in_tag:
+                                clean_token += char
+
+                        sentence_buffer += clean_token
 
                         if _should_flush(sentence_buffer, first_chunk_sent):
                             sentence_buffer  = _flush_buffer(sentence_buffer)
